@@ -1,0 +1,36 @@
+[package]
+name = "sortier-media"
+description = "Decodes stills, animations, video and sound."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+image.workspace = true
+png.workspace = true
+ffmpeg-next.workspace = true
+ffmpeg-sys-next.workspace = true
+cpal.workspace = true
+hayro.workspace = true
+zip.workspace = true
+sevenz-rust2.workspace = true
+roxmltree.workspace = true
+
+# Each system's graphics card decoders, compiled into FFmpeg.
+[target.'cfg(target_os = "macos")'.dependencies]
+ffmpeg-sys-next = { workspace = true, features = ["build-videotoolbox"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ffmpeg-sys-next = { workspace = true, features = ["build-lib-d3d11va", "build-lib-dxva2"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ffmpeg-sys-next = { workspace = true, features = ["build-vaapi"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+zip = { workspace = true, features = ["deflate"] }
+openh264.workspace = true
+mp4.workspace = true
+sevenz-rust2 = { workspace = true, features = ["compress", "util"] }

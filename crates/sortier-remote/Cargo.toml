@@ -1,0 +1,38 @@
+[package]
+name = "sortier-remote"
+description = "Sortier Remote: a headless server holding a Sortier library and its files, for the app to use over the network."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sortier-remote"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+image.workspace = true
+sortier-library.workspace = true
+sortier-media.workspace = true
+sortier-client.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tower = "0.5"
+futures-util.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+argon2.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+clap.workspace = true
+toml.workspace = true
+rpassword.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

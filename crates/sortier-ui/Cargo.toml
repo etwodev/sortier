@@ -1,0 +1,13 @@
+[package]
+name = "sortier-ui"
+description = "Sortier's design tokens, theme and shared UI primitives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-kit-assets.workspace = true
+image.workspace = true

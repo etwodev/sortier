@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# A copy of the Spline project kept for reference; not part of this build.
+exclude = ["Spline-main"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+sortier-app = { path = "crates/sortier-app" }
+sortier-areas = { path = "crates/sortier-areas" }
+sortier-client = { path = "crates/sortier-client" }
+sortier-library = { path = "crates/sortier-library" }
+sortier-media = { path = "crates/sortier-media" }
+sortier-render = { path = "crates/sortier-render" }
+sortier-ui = { path = "crates/sortier-ui" }
+
+# GPUI comes from the `gpui-pre` snapshots because gpui-component pins them
+# exactly (the crates.io `gpui` crate stopped at 0.2.2). Bump all four together.
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit"] }
+gpui-component = "=0.7.3"
+gpui-kit-assets = "=0.7.3"
+
+# The same wgpu major Spline uses for its canvas.
+wgpu = "29.0.4"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+walkdir = "2.5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "webp"] }
+# Animated PNG frames, which `image` doesn't decode. Already in the tree through `image`.
+png = "0.18"
+# Test fixtures: H.264 in MP4 written with Cisco's BSD-licensed encoder.
+openh264 = "0.9.8"
+mp4 = "0.14"
+# Video and sound decoding. FFmpeg's libraries are built from source (LGPL, no GPL parts) and linked statically,
+# as mpv and VLC do, so nobody has to install anything. Bump both together.
+ffmpeg-next = { version = "9.1.0", default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
+ffmpeg-sys-next = { version = "9.1.1", default-features = false, features = ["avcodec", "avformat", "swscale", "swresample", "build"] }
+# Plays sound through the system output.
+cpal = "0.18"
+# Documents: PDF pages rendered in pure Rust (nothing to bundle), comic archives (CBZ, CB7) and image EPUBs.
+hayro = "0.9.0"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }
+roxmltree = "0.20.0"
+# Sortier Remote: an HTTPS server (axum, rustls with ring, so nothing needs CMake or NASM) and its blocking client,
+# trusting a self-made certificate by its fingerprint.
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "query", "rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+sha2 = "0.10"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-server = { version = "0.9.2", features = ["tls-rustls-no-provider"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util", "net", "signal"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+futures-util = "0.3.34"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+argon2 = "0.6.0"
+getrandom = "0.4.3"
+clap = { version = "4.6.7", features = ["derive"] }
+toml = "1.2.1"
+rpassword = "7"
+tempfile = "3"
+
+# Image decoding and wgpu are far too slow unoptimised, so dependencies are
+# optimised even in debug builds; our own crates stay quick to rebuild.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

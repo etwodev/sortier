@@ -1,0 +1,19 @@
+[package]
+name = "sortier-client"
+description = "Talking to a Sortier Remote server: its protocol, an HTTPS client that trusts it by fingerprint, and a disk cache."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+sortier-library.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

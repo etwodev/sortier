@@ -1,0 +1,13 @@
+[package]
+name = "sortier-render"
+description = "Draws media (stills, animation and video frames) with wgpu into offscreen frames for the UI to show."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
