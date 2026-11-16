@@ -15,6 +15,7 @@ use sortier_ui::text_field::{TextField, TextFieldEvent, TextFieldState};
 use sortier_ui::tokens::spacing;
 
 use super::{EditorContext, EditorFactory};
+use crate::delete::confirm_delete;
 use crate::model::{Entry, LibraryModel};
 
 /// Which field of the inspector a tag field writes to.
@@ -189,7 +190,7 @@ impl InspectorEditor {
             MediaKind::Document => "Document",
         };
         let folder = item.path.parent().map(|path| path.display().to_string()).unwrap_or_default();
-        let (reveal, open) = (self.library.clone(), self.library.clone());
+        let (reveal, open, erase) = (self.library.clone(), self.library.clone(), self.library.clone());
         let remote = self.library.read(cx).remote_access().is_some();
         let mut panel = self
             .panel("file", "File", cx)
@@ -218,6 +219,11 @@ impl InspectorEditor {
                         Button::new("open", "Open in Default App")
                             .icon(IconKind::External)
                             .on_click(move |_, cx| open.update(cx, |library, cx| library.open_in_default_app(id, cx))),
+                    )
+                    .child(
+                        Button::new("delete-file", "Delete\u{2026}")
+                            .icon(IconKind::Trash)
+                            .on_click(move |window, cx| confirm_delete(&erase, vec![id], window, cx)),
                     ),
             );
         Some(panel)
@@ -246,7 +252,13 @@ impl InspectorEditor {
                         Button::new("dissolve-collection", "Dissolve")
                             .icon(IconKind::Ungroup)
                             .on_click(move |_, cx| dissolve.update(cx, |library, cx| library.dissolve_collection(collection, cx))),
-                    ),
+                    )
+                    .child(delete_entries_button(
+                        "delete-collection",
+                        "Delete Files\u{2026}",
+                        &self.library,
+                        Some(Entry::Collection(collection)),
+                    )),
             )
     }
 
@@ -327,6 +339,18 @@ impl InspectorEditor {
     }
 }
 
+/// A button asking to delete the files of `entry`, or of the whole selection when `None`.
+fn delete_entries_button(id: &'static str, label: &'static str, library: &Entity<LibraryModel>, entry: Option<Entry>) -> Button {
+    let library = library.clone();
+    Button::new(id, label).icon(IconKind::Trash).on_click(move |window, cx| {
+        let ids = match entry {
+            Some(entry) => library.read(cx).entry_items(entry),
+            None => library.read(cx).selected_items(),
+        };
+        confirm_delete(&library, ids, window, cx);
+    })
+}
+
 /// `text` with its last word replaced by `tag`, ready for the next word.
 fn complete(text: &str, tag: &str) -> String {
     let head = match text.rfind(char::is_whitespace) {
@@ -384,7 +408,8 @@ impl Render for InspectorEditor {
                     let panel = self
                         .panel("sequence", "Sequence", cx)
                         .row(PropertyRow::new("Name", TextField::new(&self.name)))
-                        .row(PropertyRow::new("Pages", ValueText::new(pages.to_string())));
+                        .row(PropertyRow::new("Pages", ValueText::new(pages.to_string())))
+                        .row(delete_entries_button("delete-sequence", "Delete Files\u{2026}", &self.library, Some(entry)));
                     panels.push(panel.into_any_element());
                 } else if let Some(panel) = self.file_panel(self.library.read(cx).entry_cover(entry).unwrap_or_default(), cx) {
                     panels.push(panel.into_any_element());
@@ -416,7 +441,8 @@ impl Render for InspectorEditor {
                             )
                             .child(Button::new("make-collection", "Make Collection").icon(IconKind::Collection).on_click(
                                 move |_, cx| collect.update(cx, |library, cx| library.make_collection(cx)),
-                            )),
+                            ))
+                            .child(delete_entries_button("delete-selection", "Delete\u{2026}", &self.library, None)),
                     );
                 panels.push(panel.into_any_element());
             }

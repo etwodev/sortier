@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use anyhow::{Result, bail};
-use sortier_library::library::{Library, MediaKind, Snapshot, data_dir};
+use sortier_client::api::Deleted;
+use sortier_library::library::{ItemId, Library, MediaKind, Snapshot, data_dir};
 use sortier_library::patch::Patch;
 use sortier_library::thumbs;
 use tokio::sync::{Notify, watch};
@@ -151,6 +152,25 @@ impl Server {
         held.library.apply_patch(&patch);
         self.record(&mut held, patch);
         Ok(Some(held.version))
+    }
+
+    /// Erases `ids`' files from disk for good and takes them out of the library, saying which went and why any
+    /// didn't. Blocking.
+    pub fn delete(&self, ids: &[ItemId]) -> Deleted {
+        let files: Vec<(ItemId, PathBuf)> = {
+            let held = self.held();
+            ids.iter().filter_map(|id| held.library.item(*id).map(|item| (*id, item.path.clone()))).collect()
+        };
+        let mut result = Deleted::default();
+        for (id, path) in files {
+            match std::fs::remove_file(&path) {
+                Ok(()) => result.deleted.push(id),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => result.deleted.push(id),
+                Err(error) => result.failed.push(format!("{}: {error}", path.display())),
+            }
+        }
+        self.change(|library| library.remove_items(&result.deleted));
+        result
     }
 
     pub fn covers(&self) -> PathBuf {

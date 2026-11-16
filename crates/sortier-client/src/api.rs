@@ -73,6 +73,20 @@ pub struct CoverFromPage {
     pub index: u32,
 }
 
+/// `POST /api/delete`: erases files from the server's disk for good, and takes them out of the library.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteRequest {
+    pub items: Vec<ItemId>,
+}
+
+/// Which files were erased, and why any others weren't.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Deleted {
+    pub deleted: Vec<ItemId>,
+    #[serde(default)]
+    pub failed: Vec<String>,
+}
+
 /// An error reply's body.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Problem {

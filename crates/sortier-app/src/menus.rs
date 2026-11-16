@@ -19,6 +19,7 @@ actions!(
         MakeSequence,
         SplitSequence,
         MakeCollection,
+        DeleteSelected,
         ToggleSequenceTiles,
         ToggleCrop,
         LargerTiles,
@@ -144,6 +145,8 @@ pub fn window_menus(state: &MenuState) -> Vec<Menu> {
             MenuItem::action("Make Sequence", MakeSequence).disabled(!state.has_selection),
             MenuItem::action("Split Sequence", SplitSequence).disabled(!state.has_selection),
             MenuItem::action("Make Collection", MakeCollection).disabled(!state.has_selection),
+            MenuItem::separator(),
+            MenuItem::action("Delete\u{2026}", DeleteSelected).disabled(!state.has_selection),
         ]),
         Menu::new("View").items([
             check("Sequences as One Tile", state.group_view, ToggleSequenceTiles),

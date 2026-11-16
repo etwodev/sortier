@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use sortier_library::library::ItemId;
 use sortier_library::patch::Patch;
 
-use crate::api::{Changes, CoverFromPage, CoverSaved, Hello, LibraryState, Login, PatchRequest, Problem, Token, Version};
+use crate::api::{
+    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, LibraryState, Login, PatchRequest, Problem, Token, Version,
+};
 
 /// How long an ordinary request may take.
 const REQUEST_TIME: Duration = Duration::from_secs(30);
@@ -321,6 +323,11 @@ impl RemoteClient {
         let body = reqwest::blocking::Body::sized(Counting { inner: file, sent: 0, progress }, length);
         let response = self.send(self.http.post(self.url("upload")).query(&[("path", relative)]).body(body))?;
         checked(response).map(|_| ())
+    }
+
+    /// Erases `items`' files from the server's disk for good, and takes them out of the library.
+    pub fn delete(&self, items: &[ItemId]) -> Result<Deleted, RemoteError> {
+        self.post_json("delete", &DeleteRequest { items: items.to_vec() })
     }
 
     /// Asks the server to look through its folders again now.

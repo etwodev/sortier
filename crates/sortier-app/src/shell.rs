@@ -23,6 +23,7 @@ use sortier_ui::window_frame::WindowFrame;
 use crate::area_host::AreaHost;
 use crate::editors::EditorContext;
 use crate::layouts::LayoutModel;
+use crate::delete::confirm_delete;
 use crate::menus::*;
 use crate::model::LibraryModel;
 use crate::render_service::RenderService;
@@ -337,6 +338,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+G / Ctrl+Shift+G", "Make / split a sequence"),
             ("G", "Sequences and collections as one tile"),
             ("Ctrl+\u{2193} / Ctrl+\u{2191}", "Into a collection / back out"),
+            ("Cmd+Backspace (Delete on Windows)", "Delete the selected files"),
             ("+ / \u{2212}", "Tile size"),
         ],
     ),
@@ -353,6 +355,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Home / End", "First / last page"),
             ("[ / ]", "Move the page earlier / later"),
             ("M", "Mute"),
+            ("Cmd+Backspace (Delete on Windows)", "Delete this file"),
         ],
     ),
     (
@@ -474,6 +477,10 @@ impl Render for SortierWindow {
             }))
             .on_action(cx.listener(|this, _: &SplitSequence, _, cx| {
                 this.with_library(cx, |library, cx| library.split_sequences(cx))
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
+                let ids = this.library.read(cx).selected_items();
+                confirm_delete(&this.library, ids, window, cx);
             }))
             .on_action(cx.listener(|this, _: &MakeCollection, _, cx| {
                 this.with_library(cx, |library, cx| library.make_collection(cx))

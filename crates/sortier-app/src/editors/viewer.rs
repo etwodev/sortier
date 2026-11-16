@@ -62,6 +62,7 @@ actions!(
         Mute,
         OpenExternally,
         ShowInFolder,
+        DeletePage,
     ]
 );
 
@@ -97,6 +98,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("m", Mute, context),
         KeyBinding::new("o", OpenExternally, context),
         KeyBinding::new("e", ShowInFolder, context),
+        KeyBinding::new(crate::delete::DELETE_KEY, DeletePage, context),
     ]
 }
 
@@ -1162,6 +1164,11 @@ impl Render for ViewerEditor {
                 this.apply_volume(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenExternally, _, cx| this.open_externally(cx)))
+            .on_action(cx.listener(|this, _: &DeletePage, window, cx| {
+                if let Some(page) = this.current_page(cx) {
+                    crate::delete::confirm_delete(&this.library, vec![page.item], window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowInFolder, _, cx| {
                 this.with_page(cx, |library, id, cx| library.show_in_folder(id, cx))
             }))

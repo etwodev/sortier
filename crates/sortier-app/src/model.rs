@@ -1856,6 +1856,80 @@ impl LibraryModel {
         .detach();
     }
 
+    /// The files of everything selected, each once, in result order.
+    pub fn selected_items(&self) -> Vec<ItemId> {
+        let mut selected = self.selection.clone();
+        selected.sort_by_key(|entry| self.result_index(*entry).unwrap_or(usize::MAX));
+        let mut seen = HashSet::new();
+        selected.iter().flat_map(|entry| self.entry_items(*entry)).filter(|id| seen.insert(*id)).collect()
+    }
+
+    /// Erases the files `ids` from disk for good (on the server, for a remote vault) and takes them out of the
+    /// library. Undo is cleared, since it would bring back files that are gone.
+    pub fn delete_items(&mut self, ids: Vec<ItemId>, cx: &mut Context<Self>) {
+        if ids.is_empty() || !self.can_edit(cx) {
+            return;
+        }
+        if let Some(access) = self.remote_access() {
+            let task = cx.background_spawn(async move { access.client.delete(&ids).map_err(|error| error.to_string()) });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    // The server's change feed brings the files' removal from the library.
+                    match result {
+                        Ok(deleted) => this.deleted(deleted.deleted.len(), deleted.failed, cx),
+                        Err(error) => this.deleted(0, vec![error], cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        let files: Vec<(ItemId, PathBuf)> = ids.iter().filter_map(|id| self.lib.item(*id).map(|item| (*id, item.path.clone()))).collect();
+        let serial = self.vault_serial;
+        let task = cx.background_spawn(async move {
+            let (mut deleted, mut failed) = (Vec::new(), Vec::new());
+            for (id, path) in files {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => deleted.push(id),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => deleted.push(id),
+                    Err(error) => failed.push(format!("{}: {error}", path.display())),
+                }
+            }
+            (deleted, failed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (deleted, failed) = task.await;
+            this.update(cx, |this, cx| {
+                if this.vault_serial != serial {
+                    return;
+                }
+                this.lib.remove_items(&deleted);
+                for id in &deleted {
+                    this.thumbs.remove(id);
+                }
+                this.lib.save();
+                this.undo.clear();
+                this.redo.clear();
+                this.deleted(deleted.len(), failed, cx);
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Says how deleting went.
+    fn deleted(&mut self, count: usize, failed: Vec<String>, cx: &mut Context<Self>) {
+        let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+        self.set_message(match failed.first() {
+            None => format!("Deleted {}", files(count)),
+            Some(first) => format!("Deleted {}; {} couldn't be, such as {first}", files(count), files(failed.len())),
+        });
+        cx.notify();
+    }
+
     /// Opens file `id` in the system's default app for it; a remote vault's file is fetched into its cache first.
     pub fn open_in_default_app(&mut self, id: ItemId, cx: &mut Context<Self>) {
         let Some(item) = self.lib.item(id).cloned() else { return };

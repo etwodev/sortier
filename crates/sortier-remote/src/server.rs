@@ -15,7 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use sortier_client::api::{Changes, CoverFromPage, CoverSaved, Hello, Login, PatchRequest, Problem, Token, Version};
+use sortier_client::api::{
+    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, Login, PatchRequest, Problem, Token, Version,
+};
 use sortier_library::library::{Item, ItemId, Library, MediaKind};
 use sortier_library::thumbs;
 use tokio::io::AsyncWriteExt as _;
@@ -44,6 +46,7 @@ pub fn router(server: Shared) -> Router {
         .route("/api/covers", post(save_cover))
         .route("/api/covers/from-page", post(cover_from_page))
         .route("/api/rescan", post(rescan))
+        .route("/api/delete", post(delete))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .layer(DefaultBodyLimit::max(LARGEST_REQUEST))
         .with_state(server)
@@ -260,6 +263,12 @@ async fn save_cover(State(server): State<Shared>, _: Authorized, picture: axum::
 async fn cover_from_page(State(server): State<Shared>, _: Authorized, Json(from): Json<CoverFromPage>) -> Result<Json<CoverSaved>, Failure> {
     let item = item(&server, from.item)?;
     saved(blocking(move || thumbs::save_cover(&item.path, item.kind, from.index)).await?)
+}
+
+async fn delete(State(server): State<Shared>, _: Authorized, Json(request): Json<DeleteRequest>) -> Result<Json<Deleted>, Failure> {
+    let deleting = server.clone();
+    let deleted = blocking(move || deleting.delete(&request.items)).await?;
+    Ok(Json(deleted))
 }
 
 async fn rescan(State(server): State<Shared>, _: Authorized) -> StatusCode {

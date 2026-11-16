@@ -88,6 +88,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-=", Bigger, context),
         KeyBinding::new("-", Smaller, context),
         KeyBinding::new("secondary-down", ShowVolumes, context),
+        KeyBinding::new(crate::delete::DELETE_KEY, crate::menus::DeleteSelected, context),
         KeyBinding::new("secondary-up", LeaveCollection, context),
     ]
 }

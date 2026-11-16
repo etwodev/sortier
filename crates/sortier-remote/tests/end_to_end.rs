@@ -149,4 +149,9 @@ fn the_app_can_browse_edit_stream_and_upload() {
     assert!(pictures.path().join("uploads/green.png").is_file());
     let listed = String::from_utf8(remote(data.path(), &["folders"]).stdout).unwrap();
     assert!(listed.contains(pictures.path().to_str().unwrap()), "still served after the server saved its library: {listed}");
+
+    let deleted = client.delete(&[red.id, 999_999]).unwrap();
+    assert_eq!(deleted.deleted, vec![red.id], "only files in the library are deleted");
+    assert!(!pictures.path().join("red.png").exists(), "erased from disk");
+    assert!(client.library().unwrap().library.item(red.id).is_none(), "and out of the library");
 }
