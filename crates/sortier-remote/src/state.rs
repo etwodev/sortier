@@ -4,6 +4,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use anyhow::{Result, bail};
 use sortier_library::library::{Library, MediaKind, Snapshot, data_dir};
@@ -42,7 +43,9 @@ impl Held {
 /// Everything the server's handlers share.
 pub struct Server {
     pub data: PathBuf,
-    pub config: Config,
+    config: Mutex<Config>,
+    /// When `config.toml` had last changed as `config` was read.
+    config_read: Mutex<Option<SystemTime>>,
     pub fingerprint: String,
     held: Mutex<Held>,
     pub devices: Mutex<Devices>,
@@ -57,9 +60,11 @@ impl Server {
         let library = Library::load(data.join("library.json"));
         let devices = Devices::load(&data);
         let (versions, _) = watch::channel(0);
+        let config_read = Config::changed_at(&data);
         Arc::new(Self {
             data,
-            config,
+            config: Mutex::new(config),
+            config_read: Mutex::new(config_read),
             fingerprint,
             held: Mutex::new(Held {
                 library,
@@ -70,6 +75,35 @@ impl Server {
             versions,
             rescan: Notify::new(),
         })
+    }
+
+    pub fn config(&self) -> MutexGuard<'_, Config> {
+        self.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reads `config.toml` again if it changed since it was last read (the `sortier-remote` command changes it while
+    /// the server runs), returning whether it did. A file that can't be read leaves the settings as they were.
+    pub fn reload_config(&self) -> bool {
+        let changed_at = Config::changed_at(&self.data);
+        let mut read = self.config_read.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if changed_at == *read {
+            return false;
+        }
+        *read = changed_at;
+        drop(read);
+        self.read_config()
+    }
+
+    /// Reads `config.toml` again, returning whether it could be. A file that can't be read leaves the settings as
+    /// they were.
+    fn read_config(&self) -> bool {
+        match Config::load(&self.data) {
+            Ok(config) => {
+                *self.config() = config;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn held(&self) -> MutexGuard<'_, Held> {
@@ -123,18 +157,28 @@ impl Server {
         data_dir().join("covers")
     }
 
-    /// Where uploads go.
+    /// Where uploads go: the upload folder set, else the first folder served.
     pub fn upload_folder(&self) -> Option<PathBuf> {
-        self.config.upload_folder.clone().or_else(|| self.held().library.roots.first().cloned())
+        self.reload_config();
+        let config = self.config();
+        config.upload_folder.clone().or_else(|| config.folders.first().cloned())
     }
 
-    /// Looks through the library's folders, recording what came and went, then makes the thumbnails (and learns
-    /// the sizes and page counts) of what lacks them. Blocking.
+    /// Looks through the folders served (as `config.toml` lists them now), recording what came and went (and the
+    /// files of folders no longer served as gone), then makes the thumbnails (and learns the sizes and page counts) of
+    /// what lacks them. Blocking.
     pub fn scan(&self) {
-        let roots = self.held().library.roots.clone();
-        let found = Library::scan_folders(&roots);
+        self.read_config();
+        let folders = self.config().folders.clone();
+        let found = Library::scan_folders(&folders);
         self.change(|library| {
-            library.merge_scan(&roots, found);
+            for gone in library.roots.clone().iter().filter(|root| !folders.contains(root)) {
+                library.remove_root(gone);
+            }
+            for folder in &folders {
+                library.add_root(folder.clone());
+            }
+            library.merge_scan(&folders, found);
         });
         self.make_thumbnails();
     }

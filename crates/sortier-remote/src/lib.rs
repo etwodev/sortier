@@ -17,6 +17,9 @@ use sortier_library::library::set_data_dir;
 use crate::setup::{Config, Identity, data_folder};
 use crate::state::Server;
 
+/// How often a running server looks whether `config.toml` changed.
+const CONFIG_CHECK: Duration = Duration::from_secs(5);
+
 /// How long connections get to finish once the server is asked to stop.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
@@ -64,7 +67,7 @@ pub fn serve(
     started(&Listening {
         address,
         fingerprint: server.fingerprint.clone(),
-        folders: server.held().library.roots.len(),
+        folders: server.config().folders.len(),
     });
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -84,18 +87,29 @@ pub fn serve(
     })
 }
 
-/// Scans the folders at start, then every `every`, or soon after being asked (by an upload, say).
+/// Scans the folders at start, then every `every`, or soon after being asked (by an upload, say), or after
+/// `config.toml` changed (a folder added with `sortier-remote add-folder`, say).
 async fn keep_scanning(server: Arc<Server>, every: Duration, log: Arc<dyn Fn(&str) + Send + Sync>) {
     loop {
         let scanning = server.clone();
         if let Err(error) = tokio::task::spawn_blocking(move || scanning.scan()).await {
             log(&format!("A scan failed: {error}"));
         }
-        tokio::select! {
-            _ = tokio::time::sleep(every) => {}
-            _ = server.rescan.notified() => {
-                // Uploads come several files at a time; one scan after the last will do.
-                tokio::time::sleep(Duration::from_secs(3)).await;
+        let waiting = tokio::time::sleep(every);
+        tokio::pin!(waiting);
+        loop {
+            tokio::select! {
+                _ = &mut waiting => break,
+                _ = server.rescan.notified() => {
+                    // Uploads come several files at a time; one scan after the last will do.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    break;
+                }
+                _ = tokio::time::sleep(CONFIG_CHECK) => {
+                    if server.reload_config() {
+                        break;
+                    }
+                }
             }
         }
     }

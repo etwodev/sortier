@@ -8,9 +8,12 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// `config.toml`.
+/// `config.toml`: set by the `sortier-remote` command, and read again by a running server when it changes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
+    /// The folders served: their pictures, videos and documents, and their subfolders'.
+    #[serde(default)]
+    pub folders: Vec<PathBuf>,
     #[serde(default = "default_port")]
     pub port: u16,
     /// The address to listen on: `0.0.0.0` for every network, `127.0.0.1` for this computer only.
@@ -44,6 +47,7 @@ impl Default for Config {
         Self {
             port: default_port(),
             bind: default_bind(),
+            folders: Vec::new(),
             upload_folder: None,
             rescan_minutes: default_rescan(),
             password: None,
@@ -60,12 +64,27 @@ pub fn data_folder(given: Option<PathBuf>) -> PathBuf {
 }
 
 impl Config {
+    /// The settings in `data`. Folders served before they were kept here (in `library.json`) move here the first
+    /// time.
     pub fn load(data: &Path) -> Result<Self> {
-        match std::fs::read_to_string(data.join("config.toml")) {
-            Ok(text) => toml::from_str(&text).context("config.toml can't be read"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error).context("config.toml can't be read"),
+        let mut config: Self = match std::fs::read_to_string(data.join("config.toml")) {
+            Ok(text) => toml::from_str(&text).context("config.toml can't be read")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => return Err(error).context("config.toml can't be read"),
+        };
+        if config.folders.is_empty() && data.join("library.json").is_file() {
+            let roots = sortier_library::library::Library::load(data.join("library.json")).roots;
+            if !roots.is_empty() {
+                config.folders = roots;
+                config.save(data)?;
+            }
         }
+        Ok(config)
+    }
+
+    /// When `config.toml` in `data` last changed, if it exists.
+    pub fn changed_at(data: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(data.join("config.toml")).and_then(|metadata| metadata.modified()).ok()
     }
 
     pub fn save(&self, data: &Path) -> Result<()> {
@@ -197,6 +216,17 @@ fn digest(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_served_before_move_into_the_config() {
+        let data = tempfile::tempdir().unwrap();
+        let mut library = sortier_library::library::Library::load(data.path().join("library.json"));
+        library.add_root(PathBuf::from("/srv/art"));
+        library.save();
+        assert_eq!(Config::load(data.path()).unwrap().folders, vec![PathBuf::from("/srv/art")]);
+        let saved = std::fs::read_to_string(data.path().join("config.toml")).unwrap();
+        assert!(saved.contains("/srv/art"), "{saved}");
+    }
 
     #[test]
     fn passwords_are_checked_against_their_hash() {

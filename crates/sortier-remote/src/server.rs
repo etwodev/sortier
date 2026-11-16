@@ -105,7 +105,8 @@ async fn hello() -> Json<Hello> {
 async fn login(State(server): State<Shared>, Json(login): Json<Login>) -> Result<Json<Token>, Failure> {
     let matches = {
         let server = server.clone();
-        blocking(move || server.config.password_matches(&login.password)).await?
+        let config = server.config().clone();
+        blocking(move || config.password_matches(&login.password)).await?
     };
     if !matches {
         // Slows down guessing.

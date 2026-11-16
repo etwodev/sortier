@@ -57,7 +57,6 @@ fn the_app_can_browse_edit_stream_and_upload() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     std::fs::write(data.path().join("config.toml"), format!("port = {port}\nbind = \"127.0.0.1\"\n")).unwrap();
     assert!(remote(data.path(), &["set-password"]).status.success());
-    assert!(remote(data.path(), &["add-folder", pictures.path().to_str().unwrap()]).status.success());
     let fingerprint = String::from_utf8(remote(data.path(), &["fingerprint"]).stdout).unwrap().trim().to_string();
     let _server = Running(
         Command::new(env!("CARGO_BIN_EXE_sortier-remote"))
@@ -80,7 +79,17 @@ fn the_app_can_browse_edit_stream_and_upload() {
     let client = Arc::new(RemoteClient::new(&address, &fingerprint, &token).unwrap());
     assert!(matches!(RemoteClient::new(&address, &fingerprint, "bad").unwrap().library(), Err(RemoteError::Unauthorized)));
 
-    let state = wait_for("the scan", || client.library().ok().filter(|state| state.library.items.len() == 2));
+    let staged = tempfile::tempdir().unwrap();
+    let early = staged.path().join("early.png");
+    std::fs::write(&early, png([200, 200, 30])).unwrap();
+    assert!(client.upload("early.png", &early, |_| {}).is_err(), "nowhere to upload while no folder is served");
+    assert!(remote(data.path(), &["add-folder", pictures.path().to_str().unwrap()]).status.success());
+    let listed = String::from_utf8(remote(data.path(), &["folders"]).stdout).unwrap();
+    assert!(listed.contains(pictures.path().to_str().unwrap()), "{listed}");
+
+    let state = wait_for("the folder added while running to be scanned", || {
+        client.library().ok().filter(|state| state.library.items.len() == 2)
+    });
     let red = state.library.items.values().find(|item| item.file_name() == "red.png").unwrap().clone();
     assert_eq!(red.kind, MediaKind::Image);
 
@@ -127,11 +136,8 @@ fn the_app_can_browse_edit_stream_and_upload() {
     let cover = client.cover_from_page(red.id, 0).unwrap();
     assert!(client.cover(&cover).unwrap().starts_with(&[0xff, 0xd8]));
 
-    let upload = pictures.path().join("green.png");
-    std::fs::write(&upload, png([30, 200, 30])).unwrap();
-    let staged = tempfile::tempdir().unwrap();
     let local = staged.path().join("green.png");
-    std::fs::rename(&upload, &local).unwrap();
+    std::fs::write(&local, png([30, 200, 30])).unwrap();
     client.upload("uploads/green.png", &local, |_| {}).unwrap();
     assert!(client.upload("../escape.png", &local, |_| {}).is_err());
     let changes = wait_for("the upload to be scanned", || {
@@ -141,4 +147,6 @@ fn the_app_can_browse_edit_stream_and_upload() {
     });
     assert!(changes.version > version);
     assert!(pictures.path().join("uploads/green.png").is_file());
+    let listed = String::from_utf8(remote(data.path(), &["folders"]).stdout).unwrap();
+    assert!(listed.contains(pictures.path().to_str().unwrap()), "still served after the server saved its library: {listed}");
 }

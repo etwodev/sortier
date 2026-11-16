@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use sortier_library::library::Library;
 use sortier_remote::setup::{Config, Devices, Identity};
 
 const ABOUT: &str = "Sortier Remote holds a Sortier library and its files, so the Sortier app can browse, read, play, \
@@ -95,32 +94,34 @@ fn main() -> Result<()> {
             if !path.is_dir() {
                 bail!("{} isn't a folder", path.display());
             }
-            let mut library = Library::load(data.join("library.json"));
-            if library.add_root(path.clone()) {
-                library.save();
-                println!("Serving {}. A running server picks it up at its next scan.", path.display());
-            } else {
+            if config.folders.contains(&path) {
                 println!("{} is served already.", path.display());
+                return Ok(());
             }
+            config.folders.push(path.clone());
+            config.save(&data)?;
+            println!("Serving {}. A running server starts looking through it within a few seconds.", path.display());
             Ok(())
         }
         Command::RemoveFolder { path } => {
             let path = std::path::absolute(&path)?;
-            let mut library = Library::load(data.join("library.json"));
-            library.remove_root(&path);
-            library.save();
-            println!("No longer serving {}.", path.display());
+            if !config.folders.contains(&path) {
+                bail!("{} isn't served", path.display());
+            }
+            config.folders.retain(|folder| *folder != path);
+            config.save(&data)?;
+            println!("No longer serving {}. Its files aren't touched.", path.display());
             Ok(())
         }
         Command::Folders => {
-            for root in &Library::load(data.join("library.json")).roots {
-                println!("{}", root.display());
+            for folder in &config.folders {
+                println!("{}", folder.display());
             }
             Ok(())
         }
         Command::SetUploadFolder { path } => {
             let path = std::path::absolute(&path)?;
-            let served = Library::load(data.join("library.json")).roots.iter().any(|root| path.starts_with(root));
+            let served = config.folders.iter().any(|folder| path.starts_with(folder));
             if !served {
                 eprintln!("Note: {} isn't inside a served folder, so uploads won't appear in the library.", path.display());
             }
