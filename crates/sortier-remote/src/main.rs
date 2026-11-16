@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use sortier_remote::said;
 use sortier_remote::setup::{Config, Devices, Identity};
 
 const ABOUT: &str = "Sortier Remote holds a Sortier library and its files, so the Sortier app can browse, read, play, \
@@ -17,8 +18,9 @@ Then in Sortier choose Connect to Sortier Remote from the vault menu, and check 
 `sortier-remote fingerprint`.
 
 Running it all the time:
-  Windows   run sortier-remote-tray.exe (next to this program) and tick Start with Windows in its menu: it serves
-            from the notification area whenever you're signed in. To serve before anyone signs in, register a
+  Windows   run sortier-remote-tray.exe (next to this program) and tick Start with Windows in its menu: it runs
+            `sortier-remote serve` from the notification area whenever you're signed in, and restarts it if it
+            crashes. To serve before anyone signs in, register a
             Task Scheduler task at startup running `sortier-remote serve --data <folder>` as SYSTEM, with no time
             limit (README.md has the PowerShell lines).
   Linux     a systemd unit with ExecStart=/usr/local/bin/sortier-remote serve, then systemctl enable --now
@@ -37,7 +39,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Runs the server.
-    Serve,
+    Serve {
+        /// Stops the server, cleanly, when its standard input closes: how the tray app stops the server it runs.
+        #[arg(long, hide = true)]
+        until_input_closes: bool,
+    },
     /// Sets the password devices log in with: asked for on the terminal, or taken from SORTIER_REMOTE_PASSWORD.
     SetPassword,
     /// Serves the pictures, videos and documents in a folder (and its subfolders).
@@ -61,18 +67,33 @@ fn main() -> Result<()> {
     let data = sortier_remote::open_data_folder(cli.data)?;
     let mut config = Config::load(&data)?;
     match cli.command {
-        Command::Serve => sortier_remote::serve(
-            &data,
-            |listening| {
-                if listening.folders == 0 {
-                    eprintln!("No folders are served yet: add one with sortier-remote add-folder <path>.");
-                }
-                println!("Sortier Remote is listening on {}", listening.address);
-                println!("Certificate fingerprint: {}", listening.fingerprint);
-            },
-            |message| eprintln!("{message}"),
-            std::future::pending(),
-        ),
+        Command::Serve { until_input_closes } => {
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            // Otherwise held here while the server runs, so it runs until it's ended.
+            let _held = if until_input_closes {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                    let _ = stop.send(());
+                });
+                None
+            } else {
+                Some(stop)
+            };
+            sortier_remote::serve(
+                &data,
+                |listening| {
+                    if listening.folders == 0 {
+                        eprintln!("{}", said::NO_FOLDERS);
+                    }
+                    println!("{}{}", said::LISTENING, listening.address);
+                    println!("{}{}", said::FINGERPRINT, listening.fingerprint);
+                },
+                |message| eprintln!("{message}"),
+                async move {
+                    let _ = stopped.await;
+                },
+            )
+        }
         Command::SetPassword => {
             let password = match std::env::var("SORTIER_REMOTE_PASSWORD") {
                 Ok(password) => password,

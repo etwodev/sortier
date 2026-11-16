@@ -173,3 +173,30 @@ fn the_app_can_browse_edit_stream_and_upload() {
     assert!(!pictures.path().join("red.png").exists(), "erased from disk");
     assert!(client.library().unwrap().library.item(red.id).is_none(), "and out of the library");
 }
+
+#[test]
+fn closing_its_input_stops_the_server_cleanly() {
+    let data = tempfile::tempdir().unwrap();
+    let pictures = tempfile::tempdir().unwrap();
+    std::fs::write(pictures.path().join("red.png"), png([220, 30, 30])).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    std::fs::write(data.path().join("config.toml"), format!("port = {port}\nbind = \"127.0.0.1\"\n")).unwrap();
+    assert!(remote(data.path(), &["set-password"]).status.success());
+    assert!(remote(data.path(), &["add-folder", pictures.path().to_str().unwrap()]).status.success());
+    let mut server = Running(
+        Command::new(env!("CARGO_BIN_EXE_sortier-remote"))
+            .arg("--data")
+            .arg(data.path())
+            .args(["serve", "--until-input-closes"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let address = format!("127.0.0.1:{port}");
+    wait_for("the server", || RemoteClient::probe(&address).ok());
+
+    drop(server.0.stdin.take());
+    let status = wait_for("the server to stop", || server.0.try_wait().unwrap());
+    assert!(status.success(), "it stopped as asked, not with an error: {status}");
+    assert!(RemoteClient::probe(&address).is_err(), "nothing is listening any more");
+}

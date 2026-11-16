@@ -38,6 +38,17 @@ pub fn open_data_folder(given: Option<PathBuf>) -> Result<PathBuf> {
     Ok(data)
 }
 
+/// What `sortier-remote serve` prints, one line each, which the tray app reads to follow the server it runs.
+pub mod said {
+    /// Followed by the address.
+    pub const LISTENING: &str = "Sortier Remote is listening on ";
+    /// Followed by the certificate's fingerprint.
+    pub const FINGERPRINT: &str = "Certificate fingerprint: ";
+    pub const NO_FOLDERS: &str = "No folders are served yet: add one with sortier-remote add-folder <path>.";
+    /// Begins what's printed when the server stops with an error.
+    pub const ERROR: &str = "Error: ";
+}
+
 /// A server that has started listening.
 pub struct Listening {
     pub address: SocketAddr,

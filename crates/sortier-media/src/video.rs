@@ -540,6 +540,9 @@ impl ScalerKey {
     }
 }
 
+/// What swscale's output rows are aligned to and padded by: the widest vectors it writes (AVX-512) are 64 bytes.
+const SCALE_ALIGN: usize = 64;
+
 /// Converts frames of one format and size to straight RGBA of another size, with the frame's colour space.
 struct Scaler {
     context: *mut ffi::SwsContext,
@@ -590,10 +593,15 @@ impl Scaler {
     /// `frame`, which must match the key, as tightly packed RGBA rows.
     fn run(&mut self, frame: &frame::Video) -> Result<Vec<u8>, MediaError> {
         let (width, height) = (self.key.out_width as usize, self.key.out_height as usize);
-        let mut rgba = vec![0_u8; width * height * 4];
+        let row = width * 4;
+        // swscale's vector code writes whole blocks, so a row may be written a little past its end: each row gets
+        // room to spare and the buffer some more, then the rows are packed tightly below.
+        let stride = row.next_multiple_of(SCALE_ALIGN);
+        let mut rgba = vec![0_u8; stride * height + SCALE_ALIGN];
         let destination = [rgba.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
-        let strides = [(width * 4) as i32, 0, 0, 0];
-        // SAFETY: the frame matches the context's input, and `rgba` holds exactly the output's rows.
+        let strides = [stride as i32, 0, 0, 0];
+        // SAFETY: the frame matches the context's input, and `rgba` holds `height` rows of `stride` bytes, each
+        // at least the output's row, plus padding for writes past the last one.
         let rows = unsafe {
             let source = frame.as_ptr();
             ffi::sws_scale(
@@ -609,6 +617,12 @@ impl Scaler {
         if rows <= 0 {
             return Err(MediaError::Decode("a picture couldn't be converted".into()));
         }
+        if stride != row {
+            for y in 1..height {
+                rgba.copy_within(y * stride..y * stride + row, y * row);
+            }
+        }
+        rgba.truncate(row * height);
         Ok(rgba)
     }
 }

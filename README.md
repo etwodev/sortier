@@ -61,7 +61,8 @@ cargo build --release -p sortier-remote
 ```
 
 That makes `target/release/sortier-remote.exe`, the command, and on Windows `sortier-remote-tray.exe`, which runs
-the server from the notification area. Keep the two together wherever you put them.
+the server from the notification area. Keep the two together wherever you put them: the tray app runs the server
+with `sortier-remote.exe`.
 
 ### Set it up
 
@@ -110,6 +111,13 @@ Open Data Folder, Open Log, Restart Server and Quit. Windows tucks new icons beh
 onto the taskbar to keep it in view. Start with Windows adds a "Sortier Remote" entry to your user's Run key (no
 administrator needed), so it also shows in Task Manager's Startup apps; untick it to remove it. Give the tray app
 `--data <folder>` if the server's data isn't in the usual place, and it remembers that for Start with Windows.
+
+The tray app runs the server as a process of its own (`sortier-remote serve`, with no window), so a crash in the
+server doesn't take the tray with it. It writes everything the server prints to `sortier-remote.log`, and if the
+server crashes it notes why (heap corruption, say) and starts it again five seconds later; the menu then reads
+"restarted after a crash at …". A server that crashes three times in ten minutes is left stopped, with a message
+saying so. When the server can't start at all (no password set, the port in use), a message says why; put it
+right and choose Restart Server.
 
 **Windows, before anyone signs in:** have Task Scheduler start the command at boot as SYSTEM. In PowerShell as
 administrator, with your own paths:
