@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, SharedString};
@@ -50,17 +51,44 @@ const RETRY: Duration = Duration::from_secs(10);
 /// A remote vault's connection, and where keeping in step with its server stands.
 struct RemoteVault {
     access: RemoteAccess,
-    /// The server's version of the library this computer's copy matches; `None` until fetched, and while the
-    /// server can't be reached.
+    /// The server's version of the library this computer's copy matches; `None` until fetched.
     version: Option<u64>,
+    /// Whether the server answered when last asked for changes. While it doesn't, the version is kept, so once it
+    /// answers again only what changed meanwhile is fetched rather than the whole library.
+    reachable: bool,
     /// Changes made here, in order, still to be sent.
     outgoing: VecDeque<Patch>,
     sending: bool,
     /// Covers chosen on the server, by their path there, and where they're cached here.
     covers: HashMap<PathBuf, PathBuf>,
     fetching_covers: HashSet<PathBuf>,
-    /// Files uploaded so far, of how many.
-    uploads: Option<(usize, usize)>,
+    /// How uploading is going, while files are being uploaded.
+    uploads: Option<UploadProgress>,
+    upload_queue: VecDeque<Upload>,
+    /// Bytes of the file being uploaded sent so far, counted on the thread sending it.
+    upload_sent: Arc<AtomicU64>,
+}
+
+/// A file waiting to be uploaded: where it goes on the server, where it is here, and how large it is.
+struct Upload {
+    relative: String,
+    local: PathBuf,
+    size: u64,
+}
+
+/// How uploading to a remote vault is going.
+#[derive(Clone, Debug, Default)]
+pub struct UploadProgress {
+    /// Files finished (sent or failed), of how many.
+    pub done: usize,
+    pub files: usize,
+    /// Where the file being sent goes on the server.
+    pub current: String,
+    /// Bytes sent, of how many. (As [`LibraryModel::upload_progress`] gives it, this counts the file being sent so
+    /// far as well as the finished ones.)
+    pub finished_bytes: u64,
+    pub bytes: u64,
+    pub failed: Vec<String>,
 }
 
 impl RemoteVault {
@@ -68,11 +96,14 @@ impl RemoteVault {
         Self {
             access,
             version: None,
+            reachable: true,
             outgoing: VecDeque::new(),
             sending: false,
             covers: HashMap::new(),
             fetching_covers: HashSet::new(),
             uploads: None,
+            upload_queue: VecDeque::new(),
+            upload_sent: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -205,7 +236,7 @@ impl LibraryModel {
 
     /// Whether the open vault is remote and its server can't be reached right now.
     pub fn remote_offline(&self) -> bool {
-        self.remote.as_ref().is_some_and(|remote| remote.version.is_none())
+        self.remote.as_ref().is_some_and(|remote| remote.version.is_none() || !remote.reachable)
     }
 
     /// Keeps a remote vault's library in step with its server's: fetches it, then waits for changes and makes them
@@ -259,6 +290,7 @@ impl LibraryModel {
         self.thumbs.retain(|_, thumb| matches!(thumb, Thumb::Ready(_)));
         if let Some(remote) = &mut self.remote {
             remote.version = Some(state.version);
+            remote.reachable = true;
             remote.outgoing.clear();
         }
         self.refresh(cx);
@@ -276,14 +308,19 @@ impl LibraryModel {
             Ok(changes) => changes,
             Err(error) => {
                 if let Some(remote) = &mut self.remote {
-                    remote.version = None;
+                    remote.reachable = false;
                 }
                 self.set_message(format!("{} can't be reached: {error}", self.vaults.current().name));
                 cx.notify();
                 return false;
             }
         };
+        if self.remote.as_ref().is_some_and(|remote| !remote.reachable) {
+            self.set_message(format!("{} can be reached again", self.vaults.current().name));
+            cx.notify();
+        }
         let Some(remote) = &mut self.remote else { return true };
+        remote.reachable = true;
         let Some(current) = remote.version else { return true };
         if changes.reload {
             remote.version = None;
@@ -417,7 +454,7 @@ impl LibraryModel {
     }
 
     /// Uploads `paths` (files, or folders of them, keeping their layout) to the open remote vault's server, which
-    /// adds them to the library once they're there.
+    /// adds them to the library once they're there. Files dropped while others are uploading join the same queue.
     fn upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(remote) = &mut self.remote else { return };
         let mut files = Vec::new();
@@ -425,11 +462,17 @@ impl LibraryModel {
             let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
             for entry in walkdir::WalkDir::new(&path).into_iter().filter_map(Result::ok) {
                 let file = entry.path();
-                if entry.file_type().is_file() && MediaKind::from_path(file).is_some()
+                if entry.file_type().is_file()
+                    && MediaKind::from_path(file).is_some()
                     && let Ok(relative) = file.strip_prefix(&base)
                 {
                     let relative: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-                    files.push((relative.join("/"), file.to_path_buf()));
+                    let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+                    files.push(Upload {
+                        relative: relative.join("/"),
+                        local: file.to_path_buf(),
+                        size,
+                    });
                 }
             }
         }
@@ -438,25 +481,60 @@ impl LibraryModel {
             cx.notify();
             return;
         }
-        let total = files.len();
-        remote.uploads = Some((0, total));
-        let (access, serial) = (remote.access.clone(), self.vault_serial);
-        self.set_message(format!("Uploading {total} files\u{2026}"));
+        let starting = remote.uploads.is_none();
+        let progress = remote.uploads.get_or_insert_with(UploadProgress::default);
+        progress.files += files.len();
+        progress.bytes += files.iter().map(|file| file.size).sum::<u64>();
+        remote.upload_queue.extend(files);
+        if starting {
+            self.run_uploads(cx);
+        }
         cx.notify();
+    }
+
+    /// Uploads the queued files one after another until none are left, redrawing a few times a second meanwhile so
+    /// the progress shown keeps up.
+    fn run_uploads(&mut self, cx: &mut Context<Self>) {
+        let serial = self.vault_serial;
         cx.spawn(async move |this, cx| {
-            let mut failed = Vec::new();
-            for (done, (relative, local)) in files.into_iter().enumerate() {
-                let client = access.client.clone();
-                let name = relative.clone();
-                let sent = cx.background_spawn(async move { client.upload(&relative, &local, |_| {}) }).await;
-                if let Err(error) = sent {
-                    failed.push(format!("{name}: {error}"));
-                }
-                let going = this.update(cx, |this, cx| {
-                    let Some(remote) = this.remote.as_mut().filter(|_| this.vault_serial == serial) else { return false };
-                    remote.uploads = Some((done + 1, total));
-                    this.set_message(format!("Uploaded {} of {total}\u{2026}", done + 1));
+            loop {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let uploading = this.update(cx, |this, cx| {
                     cx.notify();
+                    this.vault_serial == serial && this.remote.as_ref().is_some_and(|remote| remote.uploads.is_some())
+                });
+                if !matches!(uploading, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let next = this.update(cx, |this, _| {
+                    let remote = this.remote.as_mut().filter(|_| this.vault_serial == serial)?;
+                    let upload = remote.upload_queue.pop_front()?;
+                    remote.upload_sent.store(0, Ordering::Relaxed);
+                    if let Some(progress) = &mut remote.uploads {
+                        progress.current = upload.relative.clone();
+                    }
+                    Some((remote.access.clone(), remote.upload_sent.clone(), upload))
+                });
+                let Ok(Some((access, sent, upload))) = next else { break };
+                let (relative, local) = (upload.relative.clone(), upload.local.clone());
+                let result = cx
+                    .background_spawn(async move { access.client.upload(&relative, &local, move |bytes| sent.store(bytes, Ordering::Relaxed)) })
+                    .await;
+                let going = this.update(cx, |this, _| {
+                    let Some(progress) = this.remote.as_mut().filter(|_| this.vault_serial == serial).and_then(|remote| remote.uploads.as_mut())
+                    else {
+                        return false;
+                    };
+                    progress.done += 1;
+                    progress.finished_bytes += upload.size;
+                    if let Err(error) = result {
+                        progress.failed.push(format!("{}: {error}", upload.relative));
+                    }
                     true
                 });
                 if !matches!(going, Ok(true)) {
@@ -464,18 +542,28 @@ impl LibraryModel {
                 }
             }
             this.update(cx, |this, cx| {
-                if let Some(remote) = &mut this.remote {
-                    remote.uploads = None;
-                }
-                this.set_message(match failed.first() {
-                    None => format!("Uploaded {total} files; they appear once the server has looked at them"),
-                    Some(first) => format!("{} of {total} files couldn't be uploaded, such as {first}", failed.len()),
+                let Some(progress) = this.remote.as_mut().filter(|_| this.vault_serial == serial).and_then(|remote| remote.uploads.take())
+                else {
+                    return;
+                };
+                let files = progress.files;
+                this.set_message(match progress.failed.first() {
+                    None => format!("Uploaded {files} files; they appear once the server has looked at them"),
+                    Some(first) => format!("{} of {files} files couldn't be uploaded, such as {first}", progress.failed.len()),
                 });
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// How uploading to the open remote vault is going, while it is.
+    pub fn upload_progress(&self) -> Option<UploadProgress> {
+        let remote = self.remote.as_ref()?;
+        let mut progress = remote.uploads.clone()?;
+        progress.finished_bytes += remote.upload_sent.load(Ordering::Relaxed);
+        Some(progress)
     }
 
     pub fn vaults(&self) -> &Vaults {

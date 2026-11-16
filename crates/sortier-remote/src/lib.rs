@@ -23,6 +23,12 @@ const CONFIG_CHECK: Duration = Duration::from_secs(5);
 /// How long connections get to finish once the server is asked to stop.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
+/// How long after files are uploaded they're added to the library: they come several at a time.
+const UPLOAD_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long after the library changes it's written to disk: it often changes many times in a row.
+const SAVE_SETTLE: Duration = Duration::from_secs(2);
+
 /// The server's data folder (the one given, else `SORTIER_REMOTE_DIR`, else the system's), made if it's missing and
 /// set as the library's data folder.
 pub fn open_data_folder(given: Option<PathBuf>) -> Result<PathBuf> {
@@ -69,26 +75,50 @@ pub fn serve(
         fingerprint: server.fingerprint.clone(),
         folders: server.config().folders.len(),
     });
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
+    let serving = server.clone();
+    let saving_log = log.clone();
+    let served = runtime.block_on(async move {
+        let server = serving;
         let handle = axum_server::Handle::new();
         let stopping = handle.clone();
         tokio::spawn(async move {
             stop.await;
             stopping.graceful_shutdown(Some(STOP_GRACE));
         });
-        tokio::spawn(keep_scanning(server.clone(), rescan_every, Arc::new(log)));
+        tokio::spawn(keep_scanning(server.clone(), rescan_every, log.clone()));
+        tokio::spawn(keep_saving(server.clone(), log));
         let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
         axum_server::from_tcp_rustls(listener, config)?
             .handle(handle)
             .serve(crate::server::router(server).into_make_service())
             .await
             .context("the server stopped")
-    })
+    });
+    runtime.shutdown_timeout(STOP_GRACE);
+    if let Err(error) = server.save() {
+        saving_log(&format!("The library couldn't be saved: {error:#}"));
+    }
+    served
 }
 
-/// Scans the folders at start, then every `every`, or soon after being asked (by an upload, say), or after
-/// `config.toml` changed (a folder added with `sortier-remote add-folder`, say).
+/// Writes the library to disk a little after it changes, so a burst of changes is written once.
+async fn keep_saving(server: Arc<Server>, log: Arc<dyn Fn(&str) + Send + Sync>) {
+    loop {
+        server.unsaved.notified().await;
+        tokio::time::sleep(SAVE_SETTLE).await;
+        let saving = server.clone();
+        match tokio::task::spawn_blocking(move || saving.save()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log(&format!("The library couldn't be saved: {error:#}")),
+            Err(error) => log(&format!("The library couldn't be saved: {error}")),
+        }
+    }
+}
+
+/// Scans the folders at start, then every `every`, or when asked, or after `config.toml` changed (a folder added with
+/// `sortier-remote add-folder`, say). Uploads are added a few seconds after they come, without a scan.
 async fn keep_scanning(server: Arc<Server>, every: Duration, log: Arc<dyn Fn(&str) + Send + Sync>) {
     loop {
         let scanning = server.clone();
@@ -100,10 +130,13 @@ async fn keep_scanning(server: Arc<Server>, every: Duration, log: Arc<dyn Fn(&st
         loop {
             tokio::select! {
                 _ = &mut waiting => break,
-                _ = server.rescan.notified() => {
-                    // Uploads come several files at a time; one scan after the last will do.
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    break;
+                _ = server.rescan.notified() => break,
+                _ = server.uploads_waiting.notified() => {
+                    tokio::time::sleep(UPLOAD_SETTLE).await;
+                    let adding = server.clone();
+                    if let Err(error) = tokio::task::spawn_blocking(move || adding.add_uploads()).await {
+                        log(&format!("Uploads couldn't be added: {error}"));
+                    }
                 }
                 _ = tokio::time::sleep(CONFIG_CHECK) => {
                     if server.reload_config() {

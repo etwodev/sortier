@@ -54,6 +54,12 @@ pub struct Server {
     pub versions: watch::Sender<u64>,
     /// Wakes the scanner to look through the folders now.
     pub rescan: Notify,
+    /// Files uploaded and not yet added to the library.
+    uploaded: Mutex<Vec<PathBuf>>,
+    /// Wakes the scanner to add what was uploaded.
+    pub uploads_waiting: Notify,
+    /// Wakes the saver to write the library, which changed.
+    pub unsaved: Notify,
 }
 
 impl Server {
@@ -75,6 +81,9 @@ impl Server {
             devices: Mutex::new(devices),
             versions,
             rescan: Notify::new(),
+            uploaded: Mutex::new(Vec::new()),
+            uploads_waiting: Notify::new(),
+            unsaved: Notify::new(),
         })
     }
 
@@ -132,8 +141,19 @@ impl Server {
         if held.log.len() > KEPT_PATCHES {
             held.log.pop_front();
         }
-        held.library.save();
         self.versions.send_replace(held.version);
+        self.unsaved.notify_one();
+    }
+
+    /// Writes the library to `library.json`. The library is only held while it's copied out, so requests aren't kept
+    /// waiting while a large library is written. Blocking.
+    pub fn save(&self) -> Result<()> {
+        let bytes = serde_json::to_vec(&self.held().library)?;
+        let file = self.data.join("library.json");
+        let partial = file.with_extension("json.tmp");
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(&partial, &file)?;
+        Ok(())
     }
 
     /// Makes a client's change to the library at version `base`, returning the version after it. When the library
@@ -184,6 +204,29 @@ impl Server {
         config.upload_folder.clone().or_else(|| config.folders.first().cloned())
     }
 
+    /// Notes that `file` was uploaded, for the scanner to add to the library soon.
+    pub fn uploaded(&self, file: PathBuf) {
+        self.uploaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(file);
+        self.uploads_waiting.notify_one();
+    }
+
+    /// Adds the files uploaded since this last ran to the library and makes their thumbnails, without looking
+    /// through every folder served. Files uploaded outside the folders served are left out, as a scan would leave
+    /// them out. Blocking.
+    pub fn add_uploads(&self) {
+        let uploaded = std::mem::take(&mut *self.uploaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let folders = self.config().folders.clone();
+        let served: Vec<PathBuf> = uploaded.into_iter().filter(|file| folders.iter().any(|folder| file.starts_with(folder))).collect();
+        if served.is_empty() {
+            return;
+        }
+        let found = Library::scan_folders(&served);
+        self.change(|library| {
+            library.merge_scan(&[], found);
+        });
+        self.make_thumbnails();
+    }
+
     /// Looks through the folders served (as `config.toml` lists them now), recording what came and went (and the
     /// files of folders no longer served as gone), then makes the thumbnails (and learns the sizes and page counts) of
     /// what lacks them. Blocking.
@@ -203,32 +246,29 @@ impl Server {
         self.make_thumbnails();
     }
 
-    /// Makes missing thumbnails, and records sizes and page counts not yet known. Blocking.
+    /// Makes missing thumbnails, and records sizes and page counts not yet known. The library is only held while
+    /// its items are listed: which thumbnails exist is checked on disk without it, so requests aren't kept waiting.
+    /// Blocking.
     pub fn make_thumbnails(&self) {
-        loop {
-            let jobs: Vec<thumbs::Job> = {
-                let held = self.held();
-                held.library
-                    .items
-                    .values()
-                    .filter_map(|item| {
-                        let dest = thumbs::thumb_path(&item.path, item.modified);
-                        let need_dims = unmeasured(item);
-                        (need_dims || !dest.exists()).then(|| thumbs::Job {
-                            id: item.id,
-                            src: item.path.clone(),
-                            kind: item.kind,
-                            dest,
-                            need_dims,
-                        })
-                    })
-                    .filter(|job| !job.dest.with_extension("failed").exists())
-                    .take(THUMB_BATCH)
-                    .collect()
-            };
-            if jobs.is_empty() {
-                return;
-            }
+        let listed: Vec<thumbs::Job> = self
+            .held()
+            .library
+            .items
+            .values()
+            .map(|item| thumbs::Job {
+                id: item.id,
+                src: item.path.clone(),
+                kind: item.kind,
+                dest: thumbs::thumb_path(&item.path, item.modified),
+                need_dims: unmeasured(item),
+            })
+            .collect();
+        let mut wanted: Vec<thumbs::Job> = listed
+            .into_iter()
+            .filter(|job| (job.need_dims || !job.dest.exists()) && !job.dest.with_extension("failed").exists())
+            .collect();
+        while !wanted.is_empty() {
+            let jobs: Vec<thumbs::Job> = wanted.drain(..wanted.len().min(THUMB_BATCH)).collect();
             let attempted: Vec<(u64, PathBuf)> = jobs.iter().map(|job| (job.id, job.dest.clone())).collect();
             let results = thumbs::run_jobs(jobs);
             self.change(|library| {

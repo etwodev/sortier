@@ -2,6 +2,7 @@
 
 mod browser;
 mod inspector;
+pub(crate) use inspector::human_size;
 mod library;
 mod pages;
 mod viewer;

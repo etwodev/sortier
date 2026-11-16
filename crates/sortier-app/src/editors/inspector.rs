@@ -360,7 +360,8 @@ fn complete(text: &str, tag: &str) -> String {
     format!("{head}{tag} ")
 }
 
-fn human_size(bytes: u64) -> String {
+/// A byte count as people read it: `12.4 MB`.
+pub(crate) fn human_size(bytes: u64) -> String {
     let size = bytes as f64;
     if size >= 1e9 {
         format!("{:.1} GB", size / 1e9)

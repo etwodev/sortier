@@ -63,6 +63,59 @@ impl RenderOnce for ProgressOverlay {
     }
 }
 
+/// A slim bar along the bottom of the window showing long work that goes on in the background (such as uploading),
+/// leaving everything else usable: what's happening on the left (cut short with "…" when it doesn't fit), then a
+/// progress bar of fixed width and how far it has got, which always show.
+#[derive(IntoElement)]
+pub struct ProgressStrip {
+    label: SharedString,
+    detail: SharedString,
+    /// `0.0..=1.0`.
+    fraction: f32,
+}
+
+impl ProgressStrip {
+    pub fn new(label: impl Into<SharedString>, detail: impl Into<SharedString>, fraction: f32) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            fraction: fraction.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl RenderOnce for ProgressStrip {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.sortier_theme().colors;
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(spacing::MD)
+            .h(sizes::TOOLBAR_HEIGHT)
+            .px(spacing::MD)
+            .border_t_1()
+            .border_color(colors.seam.hsla())
+            .bg(colors.chrome.hsla())
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(Label::new(self.label).size(TextSize::Small).truncate()),
+            )
+            .child(
+                div().flex_shrink_0().w(sizes::PROGRESS_WIDTH).child(
+                    gpui_component::progress::Progress::new("strip-progress")
+                        .value(self.fraction * 100.0)
+                        .accessibility_label("Progress"),
+                ),
+            )
+            .child(div().flex_shrink_0().child(Label::new(self.detail).size(TextSize::Small).tone(TextTone::Secondary)))
+    }
+}
+
 /// A small spinner that follows the pointer while work is running, standing
 /// in for an operating-system busy cursor (GPUI has none).
 #[derive(IntoElement)]

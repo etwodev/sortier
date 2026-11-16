@@ -93,7 +93,7 @@ impl FromRequestParts<Shared> for Authorized {
     }
 }
 
-/// Runs blocking work (decoding, drawing, encoding) off the async threads.
+/// Runs blocking work (decoding, drawing, encoding, or anything holding the library) off the async threads.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, Failure> {
     tokio::task::spawn_blocking(work).await.map_err(Failure::internal)
 }
@@ -131,14 +131,15 @@ struct LibraryReply<'a> {
 }
 
 async fn library(State(server): State<Shared>, _: Authorized) -> Result<Response, Failure> {
-    let body = {
+    let body = blocking(move || {
         let held = server.held();
         serde_json::to_vec(&LibraryReply {
             version: held.version,
             library: &held.library,
         })
-        .map_err(Failure::internal)?
-    };
+    })
+    .await?
+    .map_err(Failure::internal)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
@@ -147,36 +148,41 @@ struct Since {
     since: u64,
 }
 
-async fn changes(State(server): State<Shared>, _: Authorized, Query(Since { since }): Query<Since>) -> Json<Changes> {
+async fn changes(State(server): State<Shared>, _: Authorized, Query(Since { since }): Query<Since>) -> Result<Json<Changes>, Failure> {
     let mut versions = server.versions.subscribe();
-    if server.held().version <= since {
+    if *versions.borrow_and_update() <= since {
         let _ = tokio::time::timeout(CHANGES_WAIT, versions.changed()).await;
     }
-    let held = server.held();
-    Json(match held.patches_since(since) {
-        Some(patches) => Changes {
-            version: held.version,
-            patches,
-            reload: false,
-        },
-        None => Changes {
-            version: held.version,
-            patches: Vec::new(),
-            reload: true,
-        },
+    let changes = blocking(move || {
+        let held = server.held();
+        match held.patches_since(since) {
+            Some(patches) => Changes {
+                version: held.version,
+                patches,
+                reload: false,
+            },
+            None => Changes {
+                version: held.version,
+                patches: Vec::new(),
+                reload: true,
+            },
+        }
     })
+    .await?;
+    Ok(Json(changes))
 }
 
 async fn patch(State(server): State<Shared>, _: Authorized, Json(request): Json<PatchRequest>) -> Result<Json<Version>, Failure> {
-    match server.apply_client_patch(request.base, request.patch) {
+    match blocking(move || server.apply_client_patch(request.base, request.patch)).await? {
         Ok(Some(version)) => Ok(Json(Version { version })),
         Ok(None) => Err(Failure(StatusCode::CONFLICT, "the library changed meanwhile".into())),
         Err(error) => Err(Failure(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     }
 }
 
-fn item(server: &Server, id: ItemId) -> Result<Item, Failure> {
-    server.held().library.item(id).cloned().ok_or_else(|| Failure::missing("there's no such file"))
+async fn item(server: &Shared, id: ItemId) -> Result<Item, Failure> {
+    let server = server.clone();
+    blocking(move || server.held().library.item(id).cloned()).await?.ok_or_else(|| Failure::missing("there's no such file"))
 }
 
 fn jpeg(bytes: Vec<u8>) -> Response {
@@ -184,7 +190,7 @@ fn jpeg(bytes: Vec<u8>) -> Response {
 }
 
 async fn thumbnail(State(server): State<Shared>, _: Authorized, UrlPath(id): UrlPath<ItemId>) -> Result<Response, Failure> {
-    let item = item(&server, id)?;
+    let item = item(&server, id).await?;
     let dest = thumbs::thumb_path(&item.path, item.modified);
     if !dest.exists() {
         let job = thumbs::Job {
@@ -201,13 +207,13 @@ async fn thumbnail(State(server): State<Shared>, _: Authorized, UrlPath(id): Url
 }
 
 async fn file(State(server): State<Shared>, _: Authorized, UrlPath(id): UrlPath<ItemId>, request: Request) -> Result<Response, Failure> {
-    let item = item(&server, id)?;
+    let item = item(&server, id).await?;
     let served = tower_http::services::ServeFile::new(&item.path).oneshot(request).await.map_err(Failure::internal)?;
     Ok(served.into_response())
 }
 
 async fn page(State(server): State<Shared>, _: Authorized, UrlPath((id, index)): UrlPath<(ItemId, u32)>) -> Result<Response, Failure> {
-    let item = item(&server, id)?;
+    let item = item(&server, id).await?;
     if item.kind != MediaKind::Document {
         return Err(Failure::bad("that file isn't a document"));
     }
@@ -261,7 +267,7 @@ async fn save_cover(State(server): State<Shared>, _: Authorized, picture: axum::
 }
 
 async fn cover_from_page(State(server): State<Shared>, _: Authorized, Json(from): Json<CoverFromPage>) -> Result<Json<CoverSaved>, Failure> {
-    let item = item(&server, from.item)?;
+    let item = item(&server, from.item).await?;
     saved(blocking(move || thumbs::save_cover(&item.path, item.kind, from.index)).await?)
 }
 
@@ -311,7 +317,7 @@ async fn upload(State(server): State<Shared>, _: Authorized, Query(Upload { path
     file.flush().await.map_err(Failure::internal)?;
     drop(file);
     tokio::fs::rename(&partial, &target).await.map_err(Failure::internal)?;
-    server.rescan.notify_one();
+    server.uploaded(target);
     Ok(StatusCode::CREATED)
 }
 

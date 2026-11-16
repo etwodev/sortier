@@ -13,6 +13,7 @@ use sortier_ui::dialog::{FormField, open_form_dialog, open_message_dialog};
 use sortier_ui::icon::IconKind;
 use sortier_ui::label::{Label, TextSize, TextTone};
 use sortier_ui::menu::{DropdownButton, MenuEntry};
+use sortier_ui::progress::ProgressStrip;
 use sortier_ui::menu_bar::MenuBar;
 use sortier_ui::theme::ActiveSortierTheme;
 use sortier_ui::title_bar::TitleBar;
@@ -24,6 +25,7 @@ use crate::area_host::AreaHost;
 use crate::editors::EditorContext;
 use crate::layouts::LayoutModel;
 use crate::delete::confirm_delete;
+use crate::editors::human_size;
 use crate::menus::*;
 use crate::model::LibraryModel;
 use crate::render_service::RenderService;
@@ -123,6 +125,20 @@ impl SortierWindow {
         let paths = paths.paths().to_vec();
         self.with_library(cx, |library, cx| library.add_folders(paths, cx));
     }
+}
+
+/// The bar along the bottom of the window while files are uploading to a remote vault.
+fn upload_strip(library: &LibraryModel) -> Option<ProgressStrip> {
+    let progress = library.upload_progress()?;
+    let fraction = if progress.bytes > 0 {
+        progress.finished_bytes as f32 / progress.bytes as f32
+    } else {
+        progress.done as f32 / progress.files.max(1) as f32
+    };
+    let name = progress.current.rsplit('/').next().unwrap_or_default();
+    let label = format!("Uploading {} of {}: {name}", (progress.done + 1).min(progress.files), progress.files);
+    let detail = format!("{} of {}", human_size(progress.finished_bytes), human_size(progress.bytes));
+    Some(ProgressStrip::new(label, detail, fraction))
 }
 
 /// The window's title, as the system shows it (in the Window menu and when switching apps).
@@ -552,7 +568,14 @@ impl Render for SortierWindow {
             .child(
                 WindowFrame::new(TitleBar::new(switcher))
                     .top_bar(top_bar.item(self.tabs.clone()))
-                    .body(host),
+                    .body(
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .child(div().flex_1().min_h_0().child(host))
+                            .children(upload_strip(self.library.read(cx))),
+                    ),
             )
             .when(self.dropping, |this| this.child(drop_overlay(cx)))
             .when(self.shortcuts, |this| this.child(shortcuts_overlay(cx)))
