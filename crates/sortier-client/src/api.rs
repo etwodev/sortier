@@ -73,6 +73,26 @@ pub struct CoverFromPage {
     pub index: u32,
 }
 
+/// What `POST /api/upload?path=…&if_exists=…` does when the upload folder already has a file at that path.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExists {
+    /// Leaves the file there and refuses the upload, answering `409 Conflict`.
+    #[default]
+    Refuse,
+    /// Puts the upload in its place.
+    Replace,
+    /// Keeps both, saving the upload under a free name: `name (2).jpg`, `name (3).jpg` and so on.
+    KeepBoth,
+}
+
+/// `POST /api/upload/existing`: which of `paths` (each with `/` between folders, as an upload names it) the upload
+/// folder already has a file at. The reply is the same type, holding just those.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct UploadPaths {
+    pub paths: Vec<String>,
+}
+
 /// `POST /api/delete`: erases files from the server's disk for good, and takes them out of the library.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DeleteRequest {

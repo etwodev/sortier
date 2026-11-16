@@ -27,7 +27,8 @@ use crate::layouts::LayoutModel;
 use crate::delete::confirm_delete;
 use crate::editors::human_size;
 use crate::menus::*;
-use crate::model::LibraryModel;
+use crate::duplicates::ask_about_duplicate;
+use crate::model::{AskAboutDuplicate, LibraryModel};
 use crate::render_service::RenderService;
 use crate::workspace_tabs::WorkspaceTabs;
 
@@ -65,6 +66,9 @@ impl SortierWindow {
                 cx.notify();
             }),
             cx.observe(&layouts, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&library, window, |_, library, _: &AskAboutDuplicate, window, cx| {
+                ask_about_duplicate(library, window, cx);
+            }),
         ];
         window.set_window_title(&title(library.read(cx)));
         if cfg!(target_os = "macos") {

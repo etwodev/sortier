@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Entity, ParentElement, SharedString, Styled, Window, div};
@@ -5,6 +6,7 @@ use gpui_component::WindowExt as _;
 use gpui_component::dialog::{DialogAction, DialogClose, DialogFooter};
 
 use crate::button::{Button, ButtonVariant};
+use crate::fields::Checkbox;
 use crate::label::{Label, TextSize, TextTone};
 use crate::text_field::{TextField, TextFieldState};
 use crate::tokens::spacing;
@@ -103,6 +105,93 @@ pub fn open_form_dialog(
             .on_ok(move |_, window, cx| {
                 let texts = values.iter().map(|(_, state)| state.read(cx).value().to_string()).collect();
                 on_confirm(texts, window, cx)
+            })
+    });
+}
+
+/// One answer of a choice dialog (see [`open_choice_dialog`]): its button's text and look, and the value it gives.
+pub struct Choice<T> {
+    pub value: T,
+    pub label: SharedString,
+    pub variant: ButtonVariant,
+}
+
+impl<T> Choice<T> {
+    pub fn new(value: T, label: impl Into<SharedString>, variant: ButtonVariant) -> Self {
+        Self {
+            value,
+            label: label.into(),
+            variant,
+        }
+    }
+}
+
+/// What a choice dialog asks (see [`open_choice_dialog`]).
+pub struct ChoiceQuestion<T> {
+    pub title: SharedString,
+    pub description: SharedString,
+    /// A button each, in order.
+    pub choices: Vec<Choice<T>>,
+    /// The label of a checkbox shown below the description, when there is one.
+    pub check: Option<SharedString>,
+    /// The answer when the question is closed without choosing (with Escape).
+    pub dismissed: T,
+}
+
+/// Opens a modal question. Choosing an answer closes it and calls `on_choose` with the answer's value and whether
+/// the box was ticked; closing it another way answers `question.dismissed`, with the box unticked. `on_choose` runs
+/// once the question has gone, so it may ask another.
+pub fn open_choice_dialog<T: Copy + 'static>(
+    question: ChoiceQuestion<T>,
+    on_choose: impl Fn(T, bool, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ChoiceQuestion {
+        title,
+        description,
+        choices,
+        check,
+        dismissed,
+    } = question;
+    let choices = Rc::new(choices);
+    let on_choose = Rc::new(on_choose);
+    let ticked = Rc::new(Cell::new(false));
+    let answered = Rc::new(Cell::new(false));
+    window.open_dialog(cx, move |dialog, _, _| {
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(spacing::MD)
+            .child(Label::new(description.clone()).size(TextSize::Small).tone(TextTone::Secondary));
+        if let Some(check) = &check {
+            let ticking = ticked.clone();
+            body = body.child(Checkbox::new("choice-check", ticked.get()).label(check.clone()).on_change(move |checked, window, _| {
+                ticking.set(checked);
+                window.refresh();
+            }));
+        }
+        let mut footer = DialogFooter::new();
+        for (index, choice) in choices.iter().enumerate() {
+            let (value, on_choose, ticked, answered) = (choice.value, on_choose.clone(), ticked.clone(), answered.clone());
+            footer = footer.child(Button::new(("choice", index), choice.label.clone()).variant(choice.variant).on_click(move |window, cx| {
+                answered.set(true);
+                window.close_dialog(cx);
+                let (on_choose, ticked) = (on_choose.clone(), ticked.get());
+                window.defer(cx, move |window, cx| on_choose(value, ticked, window, cx));
+            }));
+        }
+        let (on_close, answered) = (on_choose.clone(), answered.clone());
+        dialog
+            .title(title.clone())
+            .overlay_closable(false)
+            .child(body)
+            .footer(footer)
+            .on_close(move |_, window, cx| {
+                if !answered.replace(true) {
+                    let on_close = on_close.clone();
+                    window.defer(cx, move |window, cx| on_close(dismissed, false, window, cx));
+                }
             })
     });
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use sortier_library::library::ItemId;
 use sortier_library::patch::Patch;
 
 use crate::api::{
-    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, LibraryState, Login, PatchRequest, Problem, Token, Version,
+    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, IfExists, LibraryState, Login, PatchRequest, Problem, Token,
+    UploadPaths, Version,
 };
 
 /// How long an ordinary request may take.
@@ -315,13 +317,23 @@ impl RemoteClient {
         Ok(PathBuf::from(saved.path))
     }
 
+    /// Which of `relative` (paths with `/` between folders) the server's upload folder already has a file at.
+    pub fn existing_uploads(&self, relative: Vec<String>) -> Result<HashSet<String>, RemoteError> {
+        let existing: UploadPaths = self.post_json("upload/existing", &UploadPaths { paths: relative })?;
+        Ok(existing.paths.into_iter().collect())
+    }
+
     /// Uploads the file at `local` to `relative` (a path with `/` between folders) inside the server's upload
-    /// folder, calling `progress` with the bytes sent so far. The server adds it to the library shortly after.
-    pub fn upload(&self, relative: &str, local: &Path, progress: impl Fn(u64) + Send + 'static) -> Result<(), RemoteError> {
+    /// folder, calling `progress` with the bytes sent so far; `if_exists` says what to do when a file is there
+    /// already. The server adds it to the library shortly after.
+    pub fn upload(&self, relative: &str, local: &Path, if_exists: IfExists, progress: impl Fn(u64) + Send + 'static) -> Result<(), RemoteError> {
         let file = std::fs::File::open(local)?;
         let length = file.metadata()?.len();
         let body = reqwest::blocking::Body::sized(Counting { inner: file, sent: 0, progress }, length);
-        let response = self.send(self.http.post(self.url("upload")).query(&[("path", relative)]).body(body))?;
+        let response = self.send(self.http.post(self.url("upload")).query(&UploadQuery { path: relative, if_exists }).body(body))?;
+        if response.status() == StatusCode::CONFLICT {
+            return Err(RemoteError::Server("there's a file there already".into()));
+        }
         checked(response).map(|_| ())
     }
 
@@ -334,6 +346,13 @@ impl RemoteClient {
     pub fn rescan(&self) -> Result<(), RemoteError> {
         checked(self.send(self.http.post(self.url("rescan")).timeout(REQUEST_TIME))?).map(|_| ())
     }
+}
+
+/// The query of `POST /api/upload`.
+#[derive(Serialize)]
+struct UploadQuery<'a> {
+    path: &'a str,
+    if_exists: IfExists,
 }
 
 /// A reader that reports how much has been read.

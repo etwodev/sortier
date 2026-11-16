@@ -6,6 +6,7 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sortier_client::api::IfExists;
 use sortier_client::{RemoteClient, RemoteError, RemoteFile};
 use sortier_library::library::MediaKind;
 
@@ -82,7 +83,7 @@ fn the_app_can_browse_edit_stream_and_upload() {
     let staged = tempfile::tempdir().unwrap();
     let early = staged.path().join("early.png");
     std::fs::write(&early, png([200, 200, 30])).unwrap();
-    assert!(client.upload("early.png", &early, |_| {}).is_err(), "nowhere to upload while no folder is served");
+    assert!(client.upload("early.png", &early, IfExists::Refuse, |_| {}).is_err(), "nowhere to upload while no folder is served");
     assert!(remote(data.path(), &["add-folder", pictures.path().to_str().unwrap()]).status.success());
     let listed = String::from_utf8(remote(data.path(), &["folders"]).stdout).unwrap();
     assert!(listed.contains(pictures.path().to_str().unwrap()), "{listed}");
@@ -138,8 +139,8 @@ fn the_app_can_browse_edit_stream_and_upload() {
 
     let local = staged.path().join("green.png");
     std::fs::write(&local, png([30, 200, 30])).unwrap();
-    client.upload("uploads/green.png", &local, |_| {}).unwrap();
-    assert!(client.upload("../escape.png", &local, |_| {}).is_err());
+    client.upload("uploads/green.png", &local, IfExists::Refuse, |_| {}).unwrap();
+    assert!(client.upload("../escape.png", &local, IfExists::Refuse, |_| {}).is_err());
     let changes = wait_for("the upload to be scanned", || {
         let changes = client.changes(version).ok()?;
         let library = client.library().ok()?;
@@ -147,6 +148,23 @@ fn the_app_can_browse_edit_stream_and_upload() {
     });
     assert!(changes.version > version);
     assert!(pictures.path().join("uploads/green.png").is_file());
+
+    let asked = vec!["uploads/green.png".to_string(), "uploads/blue.png".to_string()];
+    let existing = client.existing_uploads(asked).unwrap();
+    assert!(existing.contains("uploads/green.png") && existing.len() == 1, "{existing:?}");
+    let darker = staged.path().join("darker.png");
+    std::fs::write(&darker, png([10, 90, 10])).unwrap();
+    assert!(client.upload("uploads/green.png", &darker, IfExists::Refuse, |_| {}).is_err(), "not overwritten unasked");
+    assert_eq!(std::fs::read(pictures.path().join("uploads/green.png")).unwrap(), png([30, 200, 30]));
+    client.upload("uploads/green.png", &darker, IfExists::KeepBoth, |_| {}).unwrap();
+    assert_eq!(std::fs::read(pictures.path().join("uploads/green (2).png")).unwrap(), png([10, 90, 10]));
+    client.upload("uploads/green.png", &darker, IfExists::Replace, |_| {}).unwrap();
+    assert_eq!(std::fs::read(pictures.path().join("uploads/green.png")).unwrap(), png([10, 90, 10]));
+    assert!(!pictures.path().join("uploads/green.sortier-upload").exists(), "no partial upload is left behind");
+    wait_for("the kept copy to be added", || {
+        let library = client.library().ok()?;
+        library.library.items.values().any(|item| item.file_name() == "green (2).png").then_some(())
+    });
     let listed = String::from_utf8(remote(data.path(), &["folders"]).stdout).unwrap();
     assert!(listed.contains(pictures.path().to_str().unwrap()), "still served after the server saved its library: {listed}");
 

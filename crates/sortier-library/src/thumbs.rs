@@ -1,4 +1,6 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use image::{DynamicImage, ImageReader, Rgb, RgbImage, RgbaImage, codecs::jpeg::JpegEncoder};
@@ -118,13 +120,22 @@ fn generate(job: &Job) -> Result<Option<(u32, u32)>> {
     Ok(dims)
 }
 
-/// Writes `image` as a JPEG at `dest`, whole or not at all.
+/// Writes `image` as a JPEG at `dest`, whole or not at all. Several threads may make the same thumbnail at once
+/// (the server's scan, and a device asking for it), so each writes a file of its own first.
 fn write_jpeg(image: DynamicImage, dest: &Path) -> Result<()> {
-    let tmp = dest.with_extension("tmp.jpg");
-    let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let tmp = dest.with_extension(format!("{}-{}.tmp", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
+    let written = encode_jpeg(image, &tmp).and_then(|()| Ok(std::fs::rename(&tmp, dest)?));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn encode_jpeg(image: DynamicImage, path: &Path) -> Result<()> {
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
     JpegEncoder::new_with_quality(&mut file, 85).encode_image(&flatten(image))?;
-    drop(file);
-    std::fs::rename(&tmp, dest)?;
+    file.flush()?;
     Ok(())
 }
 

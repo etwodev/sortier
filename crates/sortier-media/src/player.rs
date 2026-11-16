@@ -375,7 +375,7 @@ impl VideoPlayer {
 
     /// [`VideoPlayer::open`] for a video read from `source`, such as a file on a Sortier Remote server.
     pub fn open_source(source: &VideoSource, hardware: Option<HardwareDecoder>) -> Result<Self, MediaError> {
-        let mut video = VideoDecoder::open(source, hardware)?;
+        let mut video = VideoDecoder::open(source, hardware, crate::video::DecodeThreads::Auto)?;
         let first = video
             .next_frame(0.0)?
             .map(|(time, picture)| VideoFrame {

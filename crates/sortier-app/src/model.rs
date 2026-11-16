@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, SharedString};
-use sortier_client::api::{Changes, LibraryState};
+use gpui::{AppContext as _, Context, EventEmitter, SharedString};
+use sortier_client::api::{Changes, IfExists, LibraryState};
 use sortier_client::{Cache, RemoteClient, RemoteError};
 use sortier_library::library::{
     CollectionId, FitMode, Group, GroupId, Item, ItemId, Library, MediaKind, Member, Settings, Snapshot as LibrarySnapshot,
@@ -65,15 +65,40 @@ struct RemoteVault {
     /// How uploading is going, while files are being uploaded.
     uploads: Option<UploadProgress>,
     upload_queue: VecDeque<Upload>,
+    /// Files the server has a file at the same place for already, waiting for the user to say what to do.
+    duplicates: VecDeque<Upload>,
     /// Bytes of the file being uploaded sent so far, counted on the thread sending it.
     upload_sent: Arc<AtomicU64>,
 }
 
-/// A file waiting to be uploaded: where it goes on the server, where it is here, and how large it is.
+/// A file waiting to be uploaded: where it goes on the server, where it is here, how large it is, and what to do
+/// if the server has a file there already.
 struct Upload {
     relative: String,
     local: PathBuf,
     size: u64,
+    if_exists: IfExists,
+}
+
+/// What to do with a file being uploaded when the server has a file at the same place already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuplicateChoice {
+    Skip,
+    /// Upload it under a free name beside the one there.
+    KeepBoth,
+    /// Upload it in place of the one there.
+    Replace,
+}
+
+/// Asks the window to put the first waiting duplicate upload (see [`LibraryModel::duplicate_question`]) to the user.
+pub struct AskAboutDuplicate;
+
+/// A duplicate upload as the user is asked about it: the file's name, the folder on the server it goes in, and how
+/// many more duplicates wait after it.
+pub struct DuplicateQuestion {
+    pub name: String,
+    pub folder: String,
+    pub others: usize,
 }
 
 /// How uploading to a remote vault is going.
@@ -103,6 +128,7 @@ impl RemoteVault {
             fetching_covers: HashSet::new(),
             uploads: None,
             upload_queue: VecDeque::new(),
+            duplicates: VecDeque::new(),
             upload_sent: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -162,6 +188,8 @@ pub struct LibraryModel {
 }
 
 const UNDO_LIMIT: usize = 100;
+
+impl EventEmitter<AskAboutDuplicate> for LibraryModel {}
 
 impl LibraryModel {
     /// Opens the current vault's library, adds `extra_roots` to it, starts a rescan and starts looking for a graphics
@@ -455,8 +483,10 @@ impl LibraryModel {
 
     /// Uploads `paths` (files, or folders of them, keeping their layout) to the open remote vault's server, which
     /// adds them to the library once they're there. Files dropped while others are uploading join the same queue.
+    /// The server is asked first which it has files at the same place for already; the user is asked what to do
+    /// with those.
     fn upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let Some(remote) = &mut self.remote else { return };
+        let Some(remote) = &self.remote else { return };
         let mut files = Vec::new();
         for path in paths {
             let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -472,6 +502,7 @@ impl LibraryModel {
                         relative: relative.join("/"),
                         local: file.to_path_buf(),
                         size,
+                        if_exists: IfExists::Refuse,
                     });
                 }
             }
@@ -479,6 +510,37 @@ impl LibraryModel {
         if files.is_empty() {
             self.set_message("There were no pictures, videos or documents to upload");
             cx.notify();
+            return;
+        }
+        let (access, serial) = (remote.access.clone(), self.vault_serial);
+        let relative: Vec<String> = files.iter().map(|file| file.relative.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let existing = cx.background_spawn(async move { access.client.existing_uploads(relative) }).await;
+            this.update(cx, |this, cx| {
+                if this.vault_serial != serial {
+                    return;
+                }
+                let existing = match existing {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        this.set_message(format!("Nothing was uploaded: what's on the server already couldn't be checked: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                };
+                let (duplicates, fresh): (Vec<Upload>, Vec<Upload>) = files.into_iter().partition(|file| existing.contains(&file.relative));
+                this.queue_uploads(fresh, cx);
+                this.hold_duplicates(duplicates, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Adds `files` to the upload queue, starting it when it isn't running.
+    fn queue_uploads(&mut self, files: Vec<Upload>, cx: &mut Context<Self>) {
+        let Some(remote) = &mut self.remote else { return };
+        if files.is_empty() {
             return;
         }
         let starting = remote.uploads.is_none();
@@ -490,6 +552,63 @@ impl LibraryModel {
             self.run_uploads(cx);
         }
         cx.notify();
+    }
+
+    /// Keeps `duplicates` until the user says what to do with them, asking about the first unless a question is
+    /// already being asked.
+    fn hold_duplicates(&mut self, duplicates: Vec<Upload>, cx: &mut Context<Self>) {
+        let Some(remote) = &mut self.remote else { return };
+        if duplicates.is_empty() {
+            return;
+        }
+        let asking = !remote.duplicates.is_empty();
+        remote.duplicates.extend(duplicates);
+        if !asking {
+            cx.emit(AskAboutDuplicate);
+        }
+    }
+
+    /// The first duplicate upload waiting for the user to say what to do with it.
+    pub fn duplicate_question(&self) -> Option<DuplicateQuestion> {
+        let duplicates = &self.remote.as_ref()?.duplicates;
+        let first = duplicates.front()?;
+        let (folder, name) = first.relative.rsplit_once('/').unwrap_or(("", &first.relative));
+        Some(DuplicateQuestion {
+            name: name.to_string(),
+            folder: folder.to_string(),
+            others: duplicates.len() - 1,
+        })
+    }
+
+    /// Does `choice` with the first waiting duplicate upload, or with every one waiting when `for_all`, then asks
+    /// about the next if any are left.
+    pub fn answer_duplicate(&mut self, choice: DuplicateChoice, for_all: bool, cx: &mut Context<Self>) {
+        let Some(remote) = &mut self.remote else { return };
+        let count = if for_all { remote.duplicates.len() } else { remote.duplicates.len().min(1) };
+        let mut answered: Vec<Upload> = remote.duplicates.drain(..count).collect();
+        let left = !remote.duplicates.is_empty();
+        let if_exists = match choice {
+            DuplicateChoice::Skip => None,
+            DuplicateChoice::KeepBoth => Some(IfExists::KeepBoth),
+            DuplicateChoice::Replace => Some(IfExists::Replace),
+        };
+        match if_exists {
+            Some(if_exists) => {
+                for upload in &mut answered {
+                    upload.if_exists = if_exists;
+                }
+                self.queue_uploads(answered, cx);
+            }
+            None if !answered.is_empty() => {
+                let skipped = answered.len();
+                self.set_message(format!("Skipped {skipped} {} already on the server", if skipped == 1 { "file" } else { "files" }));
+                cx.notify();
+            }
+            None => {}
+        }
+        if left {
+            cx.emit(AskAboutDuplicate);
+        }
     }
 
     /// Uploads the queued files one after another until none are left, redrawing a few times a second meanwhile so
@@ -521,9 +640,11 @@ impl LibraryModel {
                     Some((remote.access.clone(), remote.upload_sent.clone(), upload))
                 });
                 let Ok(Some((access, sent, upload))) = next else { break };
-                let (relative, local) = (upload.relative.clone(), upload.local.clone());
+                let (relative, local, if_exists) = (upload.relative.clone(), upload.local.clone(), upload.if_exists);
                 let result = cx
-                    .background_spawn(async move { access.client.upload(&relative, &local, move |bytes| sent.store(bytes, Ordering::Relaxed)) })
+                    .background_spawn(async move {
+                        access.client.upload(&relative, &local, if_exists, move |bytes| sent.store(bytes, Ordering::Relaxed))
+                    })
                     .await;
                 let going = this.update(cx, |this, _| {
                     let Some(progress) = this.remote.as_mut().filter(|_| this.vault_serial == serial).and_then(|remote| remote.uploads.as_mut())

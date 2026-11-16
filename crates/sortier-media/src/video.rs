@@ -289,7 +289,7 @@ pub(crate) fn thumbnail(path: &Path, max_side: u32) -> Result<Picture, MediaErro
 }
 
 fn thumbnail_with(path: &Path, max_side: u32, hardware: Option<HardwareDecoder>) -> Result<Picture, MediaError> {
-    let mut video = VideoDecoder::open(&VideoSource::File(path.to_path_buf()), hardware)?;
+    let mut video = VideoDecoder::open(&VideoSource::File(path.to_path_buf()), hardware, DecodeThreads::One)?;
     for at in [thumbnail_time(crate::seconds(video.info.duration)), 0.0] {
         video.seek(at)?;
         if let Some((_, picture)) = video.next_sized(at, Some(max_side))? {
@@ -299,12 +299,29 @@ fn thumbnail_with(path: &Path, max_side: u32, hardware: Option<HardwareDecoder>)
     Err(MediaError::Decode("the video has no pictures".into()))
 }
 
-fn open_decoder(input: &Input, index: usize, hardware: Option<HardwareDecoder>) -> Result<ffmpeg_next::decoder::Video, MediaError> {
+/// How many threads a video decoder may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeThreads {
+    /// As many as FFmpeg finds best for the machine: for playing.
+    Auto,
+    /// One: for thumbnails, which are made many at a time, each decoder holding frames for every thread it has.
+    One,
+}
+
+fn open_decoder(
+    input: &Input,
+    index: usize,
+    hardware: Option<HardwareDecoder>,
+    threads: DecodeThreads,
+) -> Result<ffmpeg_next::decoder::Video, MediaError> {
     let stream = input.stream(index).expect("the index came from this input");
     let mut context = codec::Context::from_parameters(stream.parameters()).map_err(media_error)?;
     context.set_threading(threading::Config {
         kind: threading::Type::Frame,
-        count: 0,
+        count: match threads {
+            DecodeThreads::Auto => 0,
+            DecodeThreads::One => 1,
+        },
     });
     if let Some(device) = hardware.and_then(HardwareDecoder::open_device) {
         // SAFETY: the codec context isn't open yet, so it may be given a device; it keeps its own reference, which
@@ -331,6 +348,7 @@ pub(crate) struct VideoDecoder {
     /// The hardware decoder asked for; cleared if it fails before giving any picture, so decoding carries on on
     /// the processor.
     hardware: Option<HardwareDecoder>,
+    threads: DecodeThreads,
     /// The hardware decoder the last picture came from.
     in_use: Option<HardwareDecoder>,
     scaler: Option<Scaler>,
@@ -343,19 +361,20 @@ pub(crate) struct VideoDecoder {
 }
 
 impl VideoDecoder {
-    /// Opens `source` at its start, decoding with `hardware` where it can.
-    pub(crate) fn open(source: &VideoSource, hardware: Option<HardwareDecoder>) -> Result<Self, MediaError> {
+    /// Opens `source` at its start, decoding with `hardware` where it can, on `threads`.
+    pub(crate) fn open(source: &VideoSource, hardware: Option<HardwareDecoder>, threads: DecodeThreads) -> Result<Self, MediaError> {
         let input = open_source(source)?;
         let stream = video_stream(&input)?;
         let info = describe(&input, stream)?;
         let turns = turns_of(&input, stream);
-        let decoder = open_decoder(&input, stream, hardware)?;
+        let decoder = open_decoder(&input, stream, hardware, threads)?;
         Ok(Self {
             info,
             reader: StreamReader::new(input, stream),
             turns,
             decoder,
             hardware,
+            threads,
             in_use: None,
             scaler: None,
             held: None,
@@ -391,7 +410,7 @@ impl VideoDecoder {
         match self.next_picture(position, max_side) {
             Err(_) if self.hardware.is_some() && !self.gave_picture => {
                 self.hardware = None;
-                self.decoder = open_decoder(&self.reader.input, self.reader.index, None)?;
+                self.decoder = open_decoder(&self.reader.input, self.reader.index, None, self.threads)?;
                 self.seek(self.from)?;
                 self.next_picture(position, max_side)
             }

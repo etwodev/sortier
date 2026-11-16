@@ -2,6 +2,7 @@
 
 mod area_host;
 mod delete;
+mod duplicates;
 mod editors;
 mod layouts;
 mod menus;

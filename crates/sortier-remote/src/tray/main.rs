@@ -60,9 +60,17 @@ mod windows {
             return Ok(());
         };
         let mut app = App::new(data)?;
+        log_crashes(app.log.clone());
         app.start();
         system::run_message_loop(|| app.handle_events());
         Ok(())
+    }
+
+    /// Writes where and why anything panics into the log, which is otherwise lost: there's no terminal to print to.
+    fn log_crashes(log: Arc<Log>) {
+        std::panic::set_hook(Box::new(move |panic| {
+            log.write(&format!("Crashed: {panic}\n{}", std::backtrace::Backtrace::force_capture()));
+        }));
     }
 
     /// What the server thread tells the tray.
@@ -158,20 +166,24 @@ mod windows {
                     system::wake(main_thread);
                 };
                 let logging = log.clone();
-                let result = sortier_remote::serve(
-                    &data,
-                    |listening| {
-                        tell(News::Listening {
-                            address: listening.address,
-                            fingerprint: listening.fingerprint.clone(),
-                            folders: listening.folders,
-                        })
-                    },
-                    move |message| logging.write(message),
-                    async move {
-                        let _ = stopped.await;
-                    },
-                );
+                let serving = std::panic::AssertUnwindSafe(|| {
+                    sortier_remote::serve(
+                        &data,
+                        |listening| {
+                            tell(News::Listening {
+                                address: listening.address,
+                                fingerprint: listening.fingerprint.clone(),
+                                folders: listening.folders,
+                            })
+                        },
+                        move |message| logging.write(message),
+                        async move {
+                            let _ = stopped.await;
+                        },
+                    )
+                });
+                let result = std::panic::catch_unwind(serving)
+                    .unwrap_or_else(|_| Err(anyhow!("the server crashed; Open Log from its menu says where")));
                 tell(News::Stopped(result));
             });
         }

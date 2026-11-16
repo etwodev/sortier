@@ -16,7 +16,8 @@ use axum::routing::{get, post};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sortier_client::api::{
-    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, Login, PatchRequest, Problem, Token, Version,
+    Changes, CoverFromPage, CoverSaved, DeleteRequest, Deleted, Hello, IfExists, Login, PatchRequest, Problem, Token, UploadPaths,
+    Version,
 };
 use sortier_library::library::{Item, ItemId, Library, MediaKind};
 use sortier_library::thumbs;
@@ -27,6 +28,9 @@ use crate::state::Server;
 
 /// The largest JSON request (a patch tagging many thousands of files, say).
 const LARGEST_REQUEST: usize = 256 << 20;
+/// How much of an upload is gathered before it's written: written as it arrives, in the small pieces the network
+/// gives, each piece would be a trip to a file-writing thread.
+const UPLOAD_BUFFER: usize = 1 << 20;
 /// How long a request for changes waits for one.
 const CHANGES_WAIT: Duration = Duration::from_secs(25);
 
@@ -48,6 +52,7 @@ pub fn router(server: Shared) -> Router {
         .route("/api/rescan", post(rescan))
         .route("/api/delete", post(delete))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
+        .route("/api/upload/existing", post(existing_uploads))
         .layer(DefaultBodyLimit::max(LARGEST_REQUEST))
         .with_state(server)
 }
@@ -93,9 +98,16 @@ impl FromRequestParts<Shared> for Authorized {
     }
 }
 
-/// Runs blocking work (decoding, drawing, encoding, or anything holding the library) off the async threads.
+/// Runs blocking work (anything holding the library, or reading or writing files) off the async threads.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, Failure> {
     tokio::task::spawn_blocking(work).await.map_err(Failure::internal)
+}
+
+/// Runs decoding work (pictures, pages, video frames) off the async threads, waiting until fewer than the server's
+/// limit of it are running.
+async fn decoding<T: Send + 'static>(server: &Server, work: impl FnOnce() -> T + Send + 'static) -> Result<T, Failure> {
+    let _turn = server.decoding.acquire().await.map_err(Failure::internal)?;
+    blocking(work).await
 }
 
 async fn hello() -> Json<Hello> {
@@ -107,7 +119,7 @@ async fn hello() -> Json<Hello> {
 
 async fn login(State(server): State<Shared>, Json(login): Json<Login>) -> Result<Json<Token>, Failure> {
     let matches = {
-        let server = server.clone();
+        let _turn = server.logins.acquire().await.map_err(Failure::internal)?;
         let config = server.config().clone();
         blocking(move || config.password_matches(&login.password)).await?
     };
@@ -192,7 +204,7 @@ fn jpeg(bytes: Vec<u8>) -> Response {
 async fn thumbnail(State(server): State<Shared>, _: Authorized, UrlPath(id): UrlPath<ItemId>) -> Result<Response, Failure> {
     let item = item(&server, id).await?;
     let dest = thumbs::thumb_path(&item.path, item.modified);
-    if !dest.exists() {
+    if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
         let job = thumbs::Job {
             id,
             src: item.path.clone(),
@@ -200,7 +212,8 @@ async fn thumbnail(State(server): State<Shared>, _: Authorized, UrlPath(id): Url
             dest: dest.clone(),
             need_dims: false,
         };
-        blocking(move || thumbs::run_jobs(vec![job])).await?;
+        // The scan may have made it while this waited its turn.
+        decoding(&server, move || if !job.dest.exists() { thumbs::run_jobs(vec![job]); }).await?;
     }
     let bytes = tokio::fs::read(&dest).await.map_err(|_| Failure::missing("the thumbnail can't be made"))?;
     Ok(jpeg(bytes))
@@ -217,7 +230,7 @@ async fn page(State(server): State<Shared>, _: Authorized, UrlPath((id, index)):
     if item.kind != MediaKind::Document {
         return Err(Failure::bad("that file isn't a document"));
     }
-    let encoded = blocking(move || -> Result<Vec<u8>, String> {
+    let encoded = decoding(&server, move || -> Result<Vec<u8>, String> {
         let picture = sortier_media::document_page(&item.path, index, None).map_err(|error| error.to_string())?;
         let image = image::RgbaImage::from_raw(picture.width, picture.height, picture.rgba).ok_or("the page had the wrong size")?;
         let mut bytes = Vec::new();
@@ -254,7 +267,7 @@ fn saved(path: Result<PathBuf, anyhow::Error>) -> Result<Json<CoverSaved>, Failu
 async fn save_cover(State(server): State<Shared>, _: Authorized, picture: axum::body::Bytes) -> Result<Json<CoverSaved>, Failure> {
     let covers = server.covers();
     saved(
-        blocking(move || {
+        decoding(&server, move || {
             std::fs::create_dir_all(&covers)?;
             let upload = covers.join(format!("upload-{}", crate::setup::hex(&crate::setup::random_bytes::<8>()?)));
             std::fs::write(&upload, &picture)?;
@@ -268,7 +281,7 @@ async fn save_cover(State(server): State<Shared>, _: Authorized, picture: axum::
 
 async fn cover_from_page(State(server): State<Shared>, _: Authorized, Json(from): Json<CoverFromPage>) -> Result<Json<CoverSaved>, Failure> {
     let item = item(&server, from.item).await?;
-    saved(blocking(move || thumbs::save_cover(&item.path, item.kind, from.index)).await?)
+    saved(decoding(&server, move || thumbs::save_cover(&item.path, item.kind, from.index)).await?)
 }
 
 async fn delete(State(server): State<Shared>, _: Authorized, Json(request): Json<DeleteRequest>) -> Result<Json<Deleted>, Failure> {
@@ -285,6 +298,8 @@ async fn rescan(State(server): State<Shared>, _: Authorized) -> StatusCode {
 #[derive(Deserialize)]
 struct Upload {
     path: String,
+    #[serde(default)]
+    if_exists: IfExists,
 }
 
 /// `relative` (with `/` between folders) inside `folder`, unless it's empty or tries to leave it.
@@ -294,14 +309,51 @@ fn inside(folder: &Path, relative: &str) -> Option<PathBuf> {
     (plain && relative.components().next().is_some()).then(|| folder.join(relative))
 }
 
-async fn upload(State(server): State<Shared>, _: Authorized, Query(Upload { path }): Query<Upload>, body: Body) -> Result<StatusCode, Failure> {
+async fn existing_uploads(State(server): State<Shared>, _: Authorized, Json(asked): Json<UploadPaths>) -> Result<Json<UploadPaths>, Failure> {
     let folder = server.upload_folder().ok_or_else(|| Failure::bad("the server has no folder to upload into"))?;
-    let target = inside(&folder, &path).ok_or_else(|| Failure::bad("that isn't a path inside the upload folder"))?;
-    if let Some(parent) = target.parent() {
+    let existing = blocking(move || {
+        let mut existing = Vec::new();
+        for path in asked.paths {
+            if inside(&folder, &path).is_some_and(|target| target.exists()) {
+                existing.push(path);
+            }
+        }
+        existing
+    })
+    .await?;
+    Ok(Json(UploadPaths { paths: existing }))
+}
+
+/// `wanted`, or when there's a file there already, the first of `name (2).ext`, `name (3).ext` and so on that's free.
+fn free_name(wanted: &Path) -> PathBuf {
+    if !wanted.exists() {
+        return wanted.to_path_buf();
+    }
+    let stem = wanted.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    let extension = wanted.extension().map(|extension| format!(".{}", extension.to_string_lossy())).unwrap_or_default();
+    let mut number = 2;
+    loop {
+        let candidate = wanted.with_file_name(format!("{stem} ({number}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+async fn upload(
+    State(server): State<Shared>,
+    _: Authorized,
+    Query(Upload { path, if_exists }): Query<Upload>,
+    body: Body,
+) -> Result<StatusCode, Failure> {
+    let folder = server.upload_folder().ok_or_else(|| Failure::bad("the server has no folder to upload into"))?;
+    let wanted = inside(&folder, &path).ok_or_else(|| Failure::bad("that isn't a path inside the upload folder"))?;
+    let partial = wanted.with_extension("sortier-upload");
+    if let Some(parent) = wanted.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(Failure::internal)?;
     }
-    let partial = target.with_extension("sortier-upload");
-    let mut file = tokio::fs::File::create(&partial).await.map_err(Failure::internal)?;
+    let mut file = tokio::io::BufWriter::with_capacity(UPLOAD_BUFFER, tokio::fs::File::create(&partial).await.map_err(Failure::internal)?);
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let written = match chunk {
@@ -316,6 +368,15 @@ async fn upload(State(server): State<Shared>, _: Authorized, Query(Upload { path
     }
     file.flush().await.map_err(Failure::internal)?;
     drop(file);
+    let target = match if_exists {
+        IfExists::Replace => wanted,
+        IfExists::KeepBoth => blocking(move || free_name(&wanted)).await?,
+        IfExists::Refuse if tokio::fs::try_exists(&wanted).await.unwrap_or(true) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(Failure(StatusCode::CONFLICT, "there's a file there already".into()));
+        }
+        IfExists::Refuse => wanted,
+    };
     tokio::fs::rename(&partial, &target).await.map_err(Failure::internal)?;
     server.uploaded(target);
     Ok(StatusCode::CREATED)
@@ -334,5 +395,17 @@ mod tests {
         assert_eq!(inside(folder, ""), None);
         assert!(is_cover_name("0a1b2c3d4e5f6a7b.jpg"));
         assert!(!is_cover_name("../library.json") && !is_cover_name(".jpg"));
+    }
+
+    #[test]
+    fn keeping_both_finds_a_free_name() {
+        let folder = tempfile::tempdir().unwrap();
+        let wanted = folder.path().join("page.jpg");
+        assert_eq!(free_name(&wanted), wanted);
+        std::fs::write(&wanted, b"").unwrap();
+        assert_eq!(free_name(&wanted), folder.path().join("page (2).jpg"));
+        std::fs::write(folder.path().join("page (2).jpg"), b"").unwrap();
+        assert_eq!(free_name(&wanted), folder.path().join("page (3).jpg"));
+        assert_eq!(free_name(&folder.path().join("notes")), folder.path().join("notes"));
     }
 }

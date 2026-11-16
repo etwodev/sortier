@@ -11,7 +11,7 @@ use sortier_client::api::Deleted;
 use sortier_library::library::{ItemId, Library, MediaKind, Snapshot, data_dir};
 use sortier_library::patch::Patch;
 use sortier_library::thumbs;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 
 use crate::setup::{Config, Devices};
 
@@ -60,6 +60,11 @@ pub struct Server {
     pub uploads_waiting: Notify,
     /// Wakes the saver to write the library, which changed.
     pub unsaved: Notify,
+    /// Limits how many pictures are decoded at once for devices' requests (thumbnails, pages, covers), so a burst of
+    /// them can't use up the memory: big pictures and videos take a lot to decode.
+    pub decoding: Semaphore,
+    /// Limits password checks to one at a time: each takes a lot of memory, by design.
+    pub logins: Semaphore,
 }
 
 impl Server {
@@ -84,6 +89,8 @@ impl Server {
             uploaded: Mutex::new(Vec::new()),
             uploads_waiting: Notify::new(),
             unsaved: Notify::new(),
+            decoding: Semaphore::new(decoders()),
+            logins: Semaphore::new(1),
         })
     }
 
@@ -269,27 +276,49 @@ impl Server {
             .collect();
         while !wanted.is_empty() {
             let jobs: Vec<thumbs::Job> = wanted.drain(..wanted.len().min(THUMB_BATCH)).collect();
-            let attempted: Vec<(u64, PathBuf)> = jobs.iter().map(|job| (job.id, job.dest.clone())).collect();
             let results = thumbs::run_jobs(jobs);
-            self.change(|library| {
-                for result in &results {
-                    if let Some(item) = library.items.get_mut(&result.id) {
-                        if let Some(dims) = result.dims {
-                            item.dims = Some(dims);
-                        }
-                        if let Some(pages) = result.pages {
-                            item.pages = Some(pages);
-                        }
-                    }
-                }
-            });
-            for (id, dest) in attempted {
-                if !dest.exists() || self.held().library.item(id).is_some_and(unmeasured) {
-                    remember_failure(&dest);
+            let still_unmeasured = self.record_measurements(&results);
+            for result in &results {
+                if !result.dest.exists() || still_unmeasured.contains(&result.id) {
+                    remember_failure(&result.dest);
                 }
             }
         }
     }
+
+    /// Records the sizes and page counts `results` learned, as a patch of just the items they changed (rather than
+    /// comparing the whole library before and after), returning the items whose size is still unknown.
+    fn record_measurements(&self, results: &[thumbs::JobResult]) -> HashSet<ItemId> {
+        let mut held = self.held();
+        let mut changed = Vec::new();
+        let mut unknown = HashSet::new();
+        for result in results {
+            let Some(item) = held.library.items.get_mut(&result.id) else { continue };
+            let before = (item.dims, item.pages);
+            item.dims = result.dims.or(item.dims);
+            item.pages = result.pages.or(item.pages);
+            if (item.dims, item.pages) != before {
+                changed.push(item.clone());
+            }
+            if unmeasured(item) {
+                unknown.insert(item.id);
+            }
+        }
+        if !changed.is_empty() {
+            let patch = Patch {
+                items: changed,
+                next_id: held.library.next_id,
+                ..Patch::default()
+            };
+            self.record(&mut held, patch);
+        }
+        unknown
+    }
+}
+
+/// How many pictures may be decoded at once for devices' requests: half the processor's cores, and at least two.
+fn decoders() -> usize {
+    std::thread::available_parallelism().map_or(2, |cores| (cores.get() / 2).max(2))
 }
 
 /// Whether `patch` changes anything the `newer` patches changed.
