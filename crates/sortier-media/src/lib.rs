@@ -25,6 +25,13 @@ pub use player::{VideoPlayer, probe_video, video_thumbnail};
 pub use still::{decode_still, image_size};
 pub use video::{OpenStream, ReadSeek, VideoSource};
 
+// vcpkg's FFmpeg is built with Media Foundation, whose interface IDs live in these Windows libraries, and
+// ffmpeg-sys-next doesn't link them when it takes FFmpeg from vcpkg.
+#[cfg(target_env = "msvc")]
+#[link(name = "mfuuid")]
+#[link(name = "strmiids")]
+unsafe extern "C" {}
+
 /// Straight (non-premultiplied) RGBA8, sRGB, tightly packed: `width * height * 4` bytes, rows top to bottom.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Picture {

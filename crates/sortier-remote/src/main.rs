@@ -1,18 +1,9 @@
-mod server;
-mod setup;
-mod state;
-
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use sortier_library::library::{Library, set_data_dir};
-
-use crate::setup::{Config, Devices, Identity, data_folder};
-use crate::state::Server;
+use sortier_library::library::Library;
+use sortier_remote::setup::{Config, Devices, Identity};
 
 const ABOUT: &str = "Sortier Remote holds a Sortier library and its files, so the Sortier app can browse, read, play, \
 tag and upload to it over the network. It scans its folders and makes thumbnails itself, and keeps everyone's \
@@ -27,7 +18,10 @@ Then in Sortier choose Connect to Sortier Remote from the vault menu, and check 
 `sortier-remote fingerprint`.
 
 Running it all the time:
-  Windows   sc.exe create SortierRemote binPath= \"C:\\path\\sortier-remote.exe serve --data C:\\SortierRemote\" start= auto
+  Windows   run sortier-remote-tray.exe (next to this program) and tick Start with Windows in its menu: it serves
+            from the notification area whenever you're signed in. To serve before anyone signs in, register a
+            Task Scheduler task at startup running `sortier-remote serve --data <folder>` as SYSTEM, with no time
+            limit (README.md has the PowerShell lines).
   Linux     a systemd unit with ExecStart=/usr/local/bin/sortier-remote serve, then systemctl enable --now
   macOS     a launchd agent in ~/Library/LaunchAgents running sortier-remote serve, with RunAtLoad and KeepAlive";
 
@@ -65,12 +59,21 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let data = data_folder(cli.data);
-    std::fs::create_dir_all(&data).with_context(|| format!("{} can't be made", data.display()))?;
-    set_data_dir(data.clone());
+    let data = sortier_remote::open_data_folder(cli.data)?;
     let mut config = Config::load(&data)?;
     match cli.command {
-        Command::Serve => serve(data, config),
+        Command::Serve => sortier_remote::serve(
+            &data,
+            |listening| {
+                if listening.folders == 0 {
+                    eprintln!("No folders are served yet: add one with sortier-remote add-folder <path>.");
+                }
+                println!("Sortier Remote is listening on {}", listening.address);
+                println!("Certificate fingerprint: {}", listening.fingerprint);
+            },
+            |message| eprintln!("{message}"),
+            std::future::pending(),
+        ),
         Command::SetPassword => {
             let password = match std::env::var("SORTIER_REMOTE_PASSWORD") {
                 Ok(password) => password,
@@ -138,54 +141,6 @@ fn main() -> Result<()> {
             Devices::default().save(&data)?;
             println!("Every device is logged out. Restart a running server for it to notice.");
             Ok(())
-        }
-    }
-}
-
-fn serve(data: PathBuf, config: Config) -> Result<()> {
-    if config.password.is_none() {
-        bail!("set a password first: sortier-remote set-password");
-    }
-    let identity = Identity::load_or_make(&data)?;
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![identity.certificate.clone().into()],
-            rustls::pki_types::PrivateKeyDer::try_from(identity.key.clone()).map_err(anyhow::Error::msg)?,
-        )?;
-    let address: SocketAddr = format!("{}:{}", config.bind, config.port).parse().context("the bind address or port isn't valid")?;
-    let rescan_every = Duration::from_secs(config.rescan_minutes.max(1) * 60);
-    let server = Server::new(data, config, identity.fingerprint());
-    if server.held().library.roots.is_empty() {
-        eprintln!("No folders are served yet: add one with sortier-remote add-folder <path>.");
-    }
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        tokio::spawn(keep_scanning(server.clone(), rescan_every));
-        println!("Sortier Remote is listening on {address}");
-        println!("Certificate fingerprint: {}", server.fingerprint);
-        let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
-        axum_server::bind_rustls(address, config)
-            .serve(crate::server::router(server).into_make_service())
-            .await
-            .context("the server stopped")
-    })
-}
-
-/// Scans the folders at start, then every `every`, or soon after being asked (by an upload, say).
-async fn keep_scanning(server: Arc<Server>, every: Duration) {
-    loop {
-        let scanning = server.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || scanning.scan()).await {
-            eprintln!("A scan failed: {error}");
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(every) => {}
-            _ = server.rescan.notified() => {
-                // Uploads come several files at a time; one scan after the last will do.
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
         }
     }
 }

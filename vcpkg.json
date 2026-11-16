@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "sortier",
+  "version-string": "0.1.0",
+  "description": "FFmpeg's libraries for Windows builds, linked statically into Sortier. Install with scripts/setup-ffmpeg.ps1.",
+  "builtin-baseline": "8f363bdc11359ede4bc51e5eb32a2617538049c8",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "avformat", "swresample", "swscale"],
+      "platform": "windows"
+    }
+  ]
+}

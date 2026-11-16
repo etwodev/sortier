@@ -43,10 +43,11 @@ png = "0.18"
 # Test fixtures: H.264 in MP4 written with Cisco's BSD-licensed encoder.
 openh264 = "0.9.8"
 mp4 = "0.14"
-# Video and sound decoding. FFmpeg's libraries are built from source (LGPL, no GPL parts) and linked statically,
-# as mpv and VLC do, so nobody has to install anything. Bump both together.
+# Video and sound decoding. FFmpeg's libraries (LGPL, no GPL parts) are linked statically, as mpv and VLC do, so
+# nobody has to install anything: on Windows from vcpkg (vcpkg.json, scripts/setup-ffmpeg.ps1), elsewhere built
+# from source; see sortier-media's Cargo.toml. Bump both together, and vcpkg.json's FFmpeg to the same major.
 ffmpeg-next = { version = "9.1.0", default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
-ffmpeg-sys-next = { version = "9.1.1", default-features = false, features = ["avcodec", "avformat", "swscale", "swresample", "build"] }
+ffmpeg-sys-next = { version = "9.1.1", default-features = false, features = ["avcodec", "avformat", "swscale", "swresample"] }
 # Plays sound through the system output.
 cpal = "0.18"
 # Documents: PDF pages rendered in pure Rust (nothing to bundle), comic archives (CBZ, CB7) and image EPUBs.
@@ -72,6 +73,10 @@ clap = { version = "4.6.7", features = ["derive"] }
 toml = "1.2.1"
 rpassword = "7"
 tempfile = "3"
+# Sortier Remote's Windows tray app: its icon and menu, starting with Windows (the Run key), and the message loop.
+tray-icon = { version = "0.26.1", default-features = false }
+winreg = "0.56"
+windows-sys = "0.61.2"
 
 # Image decoding and wgpu are far too slow unoptimised, so dependencies are
 # optimised even in debug builds; our own crates stay quick to rebuild.
@@ -79,4 +84,9 @@ tempfile = "3"
 opt-level = 1
 
 [profile.dev.package."*"]
+opt-level = 3
+
+# Build scripts are unoptimised in release builds by default, and unoptimised bindgen overflows the stack
+# generating FFmpeg's bindings on Windows. The dev profile's override above already covers them.
+[profile.release.build-override]
 opt-level = 3

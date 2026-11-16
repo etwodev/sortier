@@ -1,0 +1,5 @@
+# Windows builds link FFmpeg's static libraries from the project's own vcpkg tree, which
+# scripts/setup-ffmpeg.ps1 fills from vcpkg.json. Forced, so a VCPKG_ROOT set for other projects
+# doesn't send ffmpeg-sys-next looking there. Other systems build FFmpeg from source and ignore it.
+[env]
+VCPKG_ROOT = { value = ".vcpkg", relative = true, force = true }

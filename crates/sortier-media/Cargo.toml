@@ -18,12 +18,15 @@ zip.workspace = true
 sevenz-rust2.workspace = true
 roxmltree.workspace = true
 
-# Each system's graphics card decoders, compiled into FFmpeg.
+# Where FFmpeg comes from, with each system's graphics card decoders. Windows links vcpkg's static build (which
+# enables D3D11VA and DXVA2), because building FFmpeg's configure script with MSVC needs MSYS2 and a Visual Studio
+# prompt; `static` makes ffmpeg-sys-next ask vcpkg for static libraries rather than DLLs. The others build it from
+# source (the `build-*` features turn on `build`).
 [target.'cfg(target_os = "macos")'.dependencies]
 ffmpeg-sys-next = { workspace = true, features = ["build-videotoolbox"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-ffmpeg-sys-next = { workspace = true, features = ["build-lib-d3d11va", "build-lib-dxva2"] }
+ffmpeg-sys-next = { workspace = true, features = ["static"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ffmpeg-sys-next = { workspace = true, features = ["build-vaapi"] }
